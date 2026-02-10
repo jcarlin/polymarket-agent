@@ -1,0 +1,32 @@
+# Rust
+target/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+sidecar/.venv/
+sidecar/.ruff_cache/
+sidecar/.pytest_cache/
+.mypy_cache/
+
+# Environment & secrets
+.env
+*.pem
+*.key
+
+# Data & runtime
+data/
+*.db
+*.sqlite
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
