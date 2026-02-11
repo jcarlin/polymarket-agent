@@ -496,8 +496,17 @@ mod tests {
     fn test_insert_trade() {
         let db = Database::open_in_memory().unwrap();
         insert_test_market(&db, "0xcond1");
-        db.insert_trade("trade_1", "0xcond1", "tok_yes_1", "YES", 0.65, 10.0, "filled", true)
-            .unwrap();
+        db.insert_trade(
+            "trade_1",
+            "0xcond1",
+            "tok_yes_1",
+            "YES",
+            0.65,
+            10.0,
+            "filled",
+            true,
+        )
+        .unwrap();
 
         let (side, price, size): (String, f64, f64) = db
             .conn

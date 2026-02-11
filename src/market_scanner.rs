@@ -257,6 +257,7 @@ mod tests {
             cycle_frequency_low_secs: 1800,
             low_bankroll_threshold: 200.0,
             death_exit_code: 42,
+            weather_spread_correction: 1.0,
         }
     }
 

@@ -68,3 +68,29 @@ async def test_order_endpoint_exists(client):
     )
     # Should be 503 (not initialized) not 404 (not found)
     assert response.status_code != 404
+
+
+@pytest.mark.asyncio
+async def test_weather_unknown_city_returns_404(client):
+    response = await client.get("/weather/probabilities?city=UNKNOWN&date=2026-01-15")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_weather_invalid_date_returns_400(client):
+    response = await client.get("/weather/probabilities?city=NYC&date=not-a-date")
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_weather_missing_params_returns_422(client):
+    response = await client.get("/weather/probabilities")
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_weather_endpoint_exists(client):
+    """The endpoint should exist (not 404 for valid city)."""
+    response = await client.get("/weather/probabilities?city=NYC&date=2026-01-15")
+    # Will be 502 since we can't reach Open-Meteo in tests, but NOT 404
+    assert response.status_code != 404

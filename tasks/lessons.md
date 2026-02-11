@@ -36,3 +36,12 @@ Read this at the start of every session.
 - **Accountant is stateless by design:** Reads all state from DB each cycle. This means the agent can crash and restart cleanly — cycle number is seeded from `MAX(cycle_number)` in `cycle_log`.
 - **Zero API cost skip:** When a cycle has no API calls, `close_cycle()` skips writing a bankroll_log entry entirely. This avoids noise in the ledger and prevents divide-by-zero edge cases.
 - **`tokio::select!` for Ctrl+C:** Always use `tokio::select!` between sleep and `ctrl_c()` — even with zero-duration sleep. Avoids needing the `futures` crate for `now_or_never()`.
+
+## Phase 5
+
+- **Weather is additive context, not a replacement.** Ensemble probabilities are passed as extra data in the Claude prompt. Claude weighs them alongside other factors. Non-weather markets proceed normally with `weather: None`.
+- **WeatherContext borrows from cache.** The `WeatherContext<'a>` struct holds a reference to `WeatherProbabilities` from the per-cycle HashMap cache. Cache lives for the entire loop iteration, so borrows are safe.
+- **Sidecar response doesn't include raw member temps.** The `/weather/probabilities` endpoint returns bucket probabilities, mean, and std — not the 82 raw member temperatures. The prompt renders what we have (bucket probs + statistics). Raw temps could be added in a Tier 2 upgrade.
+- **HashMap entry API for clippy.** Using `contains_key()` + `insert()` triggers clippy's `map_entry` lint. Use `Entry::Vacant(entry)` pattern instead.
+- **`parse_weather_market` is best-effort regex.** If it can't parse the question, returns None and the market goes through normal non-weather analysis. No trades are missed.
+- **Parallel Python + Rust agent streams work well.** Phase 5 used 3 streams: Python sidecar (weather module + endpoint), Rust (weather_client + config), Integration (estimator + main.rs). Python and Rust ran in parallel, integration after both completed.

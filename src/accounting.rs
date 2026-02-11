@@ -124,14 +124,8 @@ impl DeathReport {
         info!("║ Cause: {:<33}║", self.cause);
         info!("║ Cycles completed: {:<22}║", self.cycles_completed);
         info!("║ Total trades: {:<26}║", self.total_trades);
-        info!(
-            "║ Total P&L: ${:<28.2}║",
-            self.total_pnl
-        );
-        info!(
-            "║ Final bankroll: ${:<24.2}║",
-            self.final_bankroll
-        );
+        info!("║ Total P&L: ${:<28.2}║", self.total_pnl);
+        info!("║ Final bankroll: ${:<24.2}║", self.final_bankroll);
         info!("║ Open positions: {:<24}║", self.open_positions);
         info!("╠══════════════════════════════════════════╣");
         info!("║ Recent Trades:                           ║");

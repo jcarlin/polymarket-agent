@@ -112,7 +112,10 @@ impl Executor {
             new_bankroll,
             &format!(
                 "Paper {} {} @ {:.2} ({:.1} shares)",
-                side_str, intent.opportunity.question, intent.sizing.limit_price, intent.sizing.shares,
+                side_str,
+                intent.opportunity.question,
+                intent.sizing.limit_price,
+                intent.sizing.shares,
             ),
         )?;
 
@@ -158,11 +161,7 @@ impl Executor {
         let status_code = response.status();
         if !status_code.is_success() {
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Sidecar order failed ({}): {}",
-                status_code,
-                body
-            );
+            anyhow::bail!("Sidecar order failed ({}): {}", status_code, body);
         }
 
         let order_resp: SidecarOrderResponse = response
@@ -200,7 +199,10 @@ impl Executor {
             new_bankroll,
             &format!(
                 "Live {} {} @ {:.2} ({:.1} shares)",
-                side_str, intent.opportunity.question, intent.sizing.limit_price, intent.sizing.shares,
+                side_str,
+                intent.opportunity.question,
+                intent.sizing.limit_price,
+                intent.sizing.shares,
             ),
         )?;
 
@@ -277,8 +279,11 @@ mod tests {
     #[tokio::test]
     async fn test_paper_mode_logs_trade() {
         let db = setup_test_db("0xpaper1");
-        let executor =
-            Executor::with_client(Client::new(), "http://unused".to_string(), TradingMode::Paper);
+        let executor = Executor::with_client(
+            Client::new(),
+            "http://unused".to_string(),
+            TradingMode::Paper,
+        );
 
         let intent = make_intent(TradeSide::Yes, "0xpaper1");
         let result = executor.execute(&intent, &db).await.unwrap();
@@ -292,8 +297,11 @@ mod tests {
     #[tokio::test]
     async fn test_paper_mode_updates_position() {
         let db = setup_test_db("0xpaper2");
-        let executor =
-            Executor::with_client(Client::new(), "http://unused".to_string(), TradingMode::Paper);
+        let executor = Executor::with_client(
+            Client::new(),
+            "http://unused".to_string(),
+            TradingMode::Paper,
+        );
 
         let intent = make_intent(TradeSide::Yes, "0xpaper2");
         executor.execute(&intent, &db).await.unwrap();
@@ -306,8 +314,11 @@ mod tests {
     #[tokio::test]
     async fn test_paper_mode_updates_bankroll() {
         let db = setup_test_db("0xpaper3");
-        let executor =
-            Executor::with_client(Client::new(), "http://unused".to_string(), TradingMode::Paper);
+        let executor = Executor::with_client(
+            Client::new(),
+            "http://unused".to_string(),
+            TradingMode::Paper,
+        );
 
         let intent = make_intent(TradeSide::Yes, "0xpaper3");
         executor.execute(&intent, &db).await.unwrap();
@@ -331,8 +342,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let executor =
-            Executor::with_client(Client::new(), server.uri(), TradingMode::Live);
+        let executor = Executor::with_client(Client::new(), server.uri(), TradingMode::Live);
 
         let intent = make_intent(TradeSide::Yes, "0xlive1");
         let result = executor.execute(&intent, &db).await.unwrap();
@@ -356,8 +366,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let executor =
-            Executor::with_client(Client::new(), server.uri(), TradingMode::Live);
+        let executor = Executor::with_client(Client::new(), server.uri(), TradingMode::Live);
 
         let intent = make_intent(TradeSide::Yes, "0xlive2");
         executor.execute(&intent, &db).await.unwrap();
@@ -380,8 +389,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let executor =
-            Executor::with_client(Client::new(), server.uri(), TradingMode::Live);
+        let executor = Executor::with_client(Client::new(), server.uri(), TradingMode::Live);
 
         let intent = make_intent(TradeSide::Yes, "0xerr1");
         let result = executor.execute(&intent, &db).await;
@@ -420,8 +428,11 @@ mod tests {
     #[tokio::test]
     async fn test_paper_no_side_trade() {
         let db = setup_test_db("0xno1");
-        let executor =
-            Executor::with_client(Client::new(), "http://unused".to_string(), TradingMode::Paper);
+        let executor = Executor::with_client(
+            Client::new(),
+            "http://unused".to_string(),
+            TradingMode::Paper,
+        );
 
         let mut intent = make_intent(TradeSide::No, "0xno1");
         intent.sizing.limit_price = 0.45;

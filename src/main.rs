@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -7,11 +8,14 @@ use polymarket_agent::clob_client::ClobClient;
 use polymarket_agent::config::Config;
 use polymarket_agent::db::Database;
 use polymarket_agent::edge_detector::{EdgeDetector, TradeSide};
-use polymarket_agent::estimator::Estimator;
+use polymarket_agent::estimator::{Estimator, WeatherContext};
 use polymarket_agent::executor::{Executor, TradeIntent};
 use polymarket_agent::market_scanner::{GammaMarket, MarketScanner};
 use polymarket_agent::position_sizer::PositionSizer;
 use polymarket_agent::sidecar::SidecarProcess;
+use polymarket_agent::weather_client::{
+    get_weather_model_probability, parse_weather_market, WeatherClient, WeatherProbabilities,
+};
 
 /// Look up the token_id for a given market condition_id and trade side.
 fn find_token_id(markets: &[GammaMarket], condition_id: &str, side: &TradeSide) -> Option<String> {
@@ -79,6 +83,22 @@ async fn main() -> Result<()> {
         config.executor_request_timeout_secs,
     )?;
 
+    // Initialize weather client (uses sidecar endpoint)
+    let weather_client = match WeatherClient::new(
+        &config.sidecar_url(),
+        config.executor_request_timeout_secs,
+        2,
+    ) {
+        Ok(wc) => {
+            info!("Weather client initialized");
+            Some(wc)
+        }
+        Err(e) => {
+            warn!("Failed to create weather client: {}", e);
+            None
+        }
+    };
+
     let estimator = if config.anthropic_api_key.is_empty() {
         warn!("ANTHROPIC_API_KEY not set — skipping Claude analysis");
         None
@@ -132,14 +152,67 @@ async fn main() -> Result<()> {
         }
         info!("Got CLOB prices for {} markets", priced_markets.len());
 
+        // Step 2.5: Fetch weather data for weather markets
+        let mut weather_cache: HashMap<(String, String), WeatherProbabilities> = HashMap::new();
+        if let Some(ref wc) = weather_client {
+            for (market, _) in &priced_markets {
+                if let Some(info) = parse_weather_market(&market.question) {
+                    let key = (info.city.clone(), info.date.clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        weather_cache.entry(key)
+                    {
+                        match wc.get_probabilities(&info.city, &info.date).await {
+                            Ok(probs) => {
+                                info!(
+                                    "Weather data for {}/{}: mean={:.1}°F, std={:.1}°F",
+                                    info.city, info.date, probs.ensemble_mean, probs.ensemble_std
+                                );
+                                entry.insert(probs);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "Weather fetch failed for {}/{}: {}",
+                                    info.city, info.date, err
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !weather_cache.is_empty() {
+            info!(
+                "Fetched weather data for {} city/date combinations",
+                weather_cache.len()
+            );
+        }
+
         // Step 3: Claude analysis (if estimator available)
         let mut cycle_cost = 0.0_f64;
         let mut analyses = Vec::new();
 
         if let Some(ref estimator) = estimator {
             for (market, prices) in &priced_markets {
+                // Build weather context if available for this market
+                let weather_ctx = parse_weather_market(&market.question).and_then(|info| {
+                    let key = (info.city.clone(), info.date.clone());
+                    weather_cache.get(&key).map(|probs| {
+                        let model_prob = get_weather_model_probability(&info, probs);
+                        WeatherContext {
+                            probs,
+                            model_probability: model_prob,
+                        }
+                    })
+                });
+
                 match estimator
-                    .evaluate(market, prices, cycle_cost, config.max_api_cost_per_cycle)
+                    .evaluate(
+                        market,
+                        prices,
+                        cycle_cost,
+                        config.max_api_cost_per_cycle,
+                        weather_ctx.as_ref(),
+                    )
                     .await
                 {
                     Ok(Some(result)) => {

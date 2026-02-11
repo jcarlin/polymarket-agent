@@ -8,3 +8,4 @@ pub mod executor;
 pub mod market_scanner;
 pub mod position_sizer;
 pub mod sidecar;
+pub mod weather_client;

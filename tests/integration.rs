@@ -115,8 +115,7 @@ async fn test_paper_trade_end_to_end() {
     let sizing = sizer.size_position(&opp, 50.0, 0.0);
     assert!(!sizing.is_rejected());
 
-    let executor =
-        Executor::new("http://unused:9999", TradingMode::Paper, 5).unwrap();
+    let executor = Executor::new("http://unused:9999", TradingMode::Paper, 5).unwrap();
     let intent = TradeIntent {
         opportunity: opp,
         token_id: "tok_yes_e2e".to_string(),
@@ -204,4 +203,102 @@ fn test_cycle_number_persistence() {
 
     // Should resume at cycle 4
     assert_eq!(db.get_next_cycle_number().unwrap(), 4);
+}
+
+#[test]
+fn test_weather_market_parsing_and_bucket_lookup() {
+    use polymarket_agent::weather_client::{
+        get_weather_model_probability, parse_weather_market, BucketProbability,
+        WeatherProbabilities,
+    };
+
+    let q =
+        "Will the high temperature in New York City on February 20, 2026 be between 74°F and 76°F?";
+    let info = parse_weather_market(q).unwrap();
+    assert_eq!(info.city, "NYC");
+    assert_eq!(info.date, "2026-02-20");
+    assert_eq!(info.bucket_lower, 74.0);
+    assert_eq!(info.bucket_upper, 76.0);
+
+    let probs = WeatherProbabilities {
+        city: "NYC".to_string(),
+        station_icao: "KLGA".to_string(),
+        forecast_date: "2026-02-20".to_string(),
+        buckets: vec![
+            BucketProbability {
+                bucket_label: "72-74".to_string(),
+                lower: 72.0,
+                upper: 74.0,
+                probability: 0.15,
+            },
+            BucketProbability {
+                bucket_label: "74-76".to_string(),
+                lower: 74.0,
+                upper: 76.0,
+                probability: 0.35,
+            },
+            BucketProbability {
+                bucket_label: "76-78".to_string(),
+                lower: 76.0,
+                upper: 78.0,
+                probability: 0.30,
+            },
+        ],
+        ensemble_mean: 75.0,
+        ensemble_std: 2.0,
+        gefs_count: 31,
+        ecmwf_count: 51,
+    };
+
+    let prob = get_weather_model_probability(&info, &probs).unwrap();
+    assert!((prob - 0.35).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn test_weather_client_deserialization() {
+    use polymarket_agent::weather_client::WeatherClient;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    let response_json = serde_json::json!({
+        "city": "CHI",
+        "station_icao": "KORD",
+        "forecast_date": "2026-03-15",
+        "buckets": [
+            {"bucket_label": "40-42", "lower": 40.0, "upper": 42.0, "probability": 0.25},
+            {"bucket_label": "42-44", "lower": 42.0, "upper": 44.0, "probability": 0.40},
+            {"bucket_label": "44-46", "lower": 44.0, "upper": 46.0, "probability": 0.20},
+        ],
+        "ensemble_mean": 42.8,
+        "ensemble_std": 2.1,
+        "gefs_count": 31,
+        "ecmwf_count": 51
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/weather/probabilities"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response_json))
+        .mount(&server)
+        .await;
+
+    let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
+    let result = client.get_probabilities("CHI", "2026-03-15").await.unwrap();
+
+    assert_eq!(result.city, "CHI");
+    assert_eq!(result.station_icao, "KORD");
+    assert_eq!(result.buckets.len(), 3);
+    assert!((result.ensemble_mean - 42.8).abs() < 0.01);
+    assert_eq!(result.gefs_count, 31);
+    assert_eq!(result.ecmwf_count, 51);
+}
+
+#[test]
+fn test_weather_non_weather_market_returns_none() {
+    use polymarket_agent::weather_client::parse_weather_market;
+
+    assert!(parse_weather_market("Will Bitcoin reach $100k?").is_none());
+    assert!(parse_weather_market("Will the election happen?").is_none());
+    assert!(parse_weather_market("").is_none());
 }

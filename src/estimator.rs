@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 use crate::clob_client::MarketPrices;
 use crate::config::Config;
 use crate::market_scanner::GammaMarket;
+use crate::weather_client::WeatherProbabilities;
 
 // ─── Token pricing (USD per million tokens) ───
 
@@ -124,6 +125,14 @@ pub struct AnalysisResult {
     pub api_calls: Vec<ApiCallCost>,
 }
 
+// ─── Weather context for prompt enrichment ───
+
+/// Weather data passed to the estimator for prompt enrichment
+pub struct WeatherContext<'a> {
+    pub probs: &'a WeatherProbabilities,
+    pub model_probability: Option<f64>,
+}
+
 // ─── The Estimator ───
 
 pub struct Estimator {
@@ -227,8 +236,9 @@ impl Estimator {
         &self,
         market: &GammaMarket,
         prices: &MarketPrices,
+        weather: Option<&WeatherContext<'_>>,
     ) -> Result<(FairValueEstimate, ApiCallCost)> {
-        let prompt = self.render_prompt(market, prices);
+        let prompt = self.render_prompt(market, prices, weather);
         let response = self.call_claude(&self.sonnet_model, &prompt, 1024).await?;
         let estimate = self.parse_estimate(&response)?;
 
@@ -255,6 +265,7 @@ impl Estimator {
         prices: &MarketPrices,
         cycle_cost_so_far: f64,
         max_cost_per_cycle: f64,
+        weather: Option<&WeatherContext<'_>>,
     ) -> Result<Option<AnalysisResult>> {
         if cycle_cost_so_far >= max_cost_per_cycle {
             info!(
@@ -277,7 +288,7 @@ impl Estimator {
             return Ok(None);
         }
 
-        let (estimate, analysis_cost) = self.analyze(market, prices).await?;
+        let (estimate, analysis_cost) = self.analyze(market, prices, weather).await?;
         total_cost += analysis_cost.cost_usd;
         api_calls.push(analysis_cost);
 
@@ -293,7 +304,12 @@ impl Estimator {
 
     // ─── Internal helpers ───
 
-    fn render_prompt(&self, market: &GammaMarket, prices: &MarketPrices) -> String {
+    fn render_prompt(
+        &self,
+        market: &GammaMarket,
+        prices: &MarketPrices,
+        weather: Option<&WeatherContext<'_>>,
+    ) -> String {
         let category = market
             .tags
             .first()
@@ -322,13 +338,90 @@ impl Estimator {
             &format!("{:.0}", market.liquidity.unwrap_or(0.0)),
         );
 
-        // Remove conditional blocks (weather, sports, crypto, news) — not available in Phase 2
-        prompt = Self::remove_conditional_blocks(&prompt, "weather_data");
+        // Weather: fill or remove conditional block
+        if let Some(wx) = weather {
+            let weather_content = Self::render_weather_block(wx);
+            prompt = Self::replace_conditional_block(&prompt, "weather_data", &weather_content);
+        } else {
+            prompt = Self::remove_conditional_blocks(&prompt, "weather_data");
+        }
+
+        // Remove other conditional blocks — not yet available
         prompt = Self::remove_conditional_blocks(&prompt, "sports_data");
         prompt = Self::remove_conditional_blocks(&prompt, "crypto_data");
         prompt = Self::remove_conditional_blocks(&prompt, "news_data");
 
         prompt
+    }
+
+    /// Render weather ensemble data as prompt content
+    fn render_weather_block(wx: &WeatherContext<'_>) -> String {
+        let mut block = String::new();
+        block.push_str("### Weather Ensemble Forecast\n");
+        block.push_str(&format!("- **City:** {}\n", wx.probs.city));
+        block.push_str(&format!(
+            "- **Station:** {} (resolution source: Weather Underground)\n",
+            wx.probs.station_icao
+        ));
+        block.push_str(&format!(
+            "- **Forecast date:** {}\n",
+            wx.probs.forecast_date
+        ));
+        block.push_str(&format!(
+            "- **Ensemble members:** {} GEFS + {} ECMWF = {} total\n",
+            wx.probs.gefs_count,
+            wx.probs.ecmwf_count,
+            wx.probs.gefs_count + wx.probs.ecmwf_count,
+        ));
+        block.push_str(&format!(
+            "- **Combined ensemble mean:** {:.1}°F\n",
+            wx.probs.ensemble_mean
+        ));
+        block.push_str(&format!(
+            "- **Combined ensemble std dev:** {:.1}°F\n",
+            wx.probs.ensemble_std
+        ));
+        block.push_str("- **Temperature bucket probabilities:**\n");
+        for bucket in &wx.probs.buckets {
+            if bucket.probability > 0.005 {
+                block.push_str(&format!(
+                    "  - {}°F: {:.1}%\n",
+                    bucket.bucket_label,
+                    bucket.probability * 100.0
+                ));
+            }
+        }
+        if let Some(mp) = wx.model_probability {
+            block.push_str(&format!(
+                "- **Model probability for this outcome:** {:.1}%\n",
+                mp * 100.0
+            ));
+        }
+        block
+    }
+
+    /// Replace {{#if var}}...{{/if}} with provided content
+    fn replace_conditional_block(template: &str, var_name: &str, content: &str) -> String {
+        let start_tag = format!("{{{{#if {}}}}}", var_name);
+        let end_tag = "{{/if}}";
+
+        if let Some(start_pos) = template.find(&start_tag) {
+            if let Some(end_offset) = template[start_pos..].find(end_tag) {
+                let end_abs = start_pos + end_offset + end_tag.len();
+                let end_abs = if template.as_bytes().get(end_abs) == Some(&b'\n') {
+                    end_abs + 1
+                } else {
+                    end_abs
+                };
+                return format!(
+                    "{}{}{}",
+                    &template[..start_pos],
+                    content,
+                    &template[end_abs..]
+                );
+            }
+        }
+        template.to_string()
     }
 
     /// Remove {{#if var}}...{{/if}} blocks from template
@@ -569,7 +662,7 @@ mod tests {
         );
         let market = sample_market();
         let prices = sample_prices();
-        let prompt = estimator.render_prompt(&market, &prices);
+        let prompt = estimator.render_prompt(&market, &prices, None);
 
         assert!(prompt.contains("Will it rain in NYC tomorrow?"));
         assert!(prompt.contains("Weather"));
@@ -591,13 +684,66 @@ mod tests {
         );
         let market = sample_market();
         let prices = sample_prices();
-        let prompt = estimator.render_prompt(&market, &prices);
+        let prompt = estimator.render_prompt(&market, &prices, None);
 
         // The {{#if weather_data}}...{{/if}} block should be removed
         assert!(!prompt.contains("{{#if weather_data}}"));
         assert!(!prompt.contains("{{/if}}"));
         assert!(!prompt.contains("{{weather}}"));
         assert!(!prompt.contains("{{#if sports_data}}"));
+    }
+
+    // 5b. test_render_prompt_with_weather
+    #[test]
+    fn test_render_prompt_with_weather() {
+        use crate::weather_client::{BucketProbability as WBucket, WeatherProbabilities as WProbs};
+
+        let estimator = Estimator::with_client(
+            Client::new(),
+            "http://unused".to_string(),
+            "test-key".to_string(),
+            test_template(),
+        );
+        let market = sample_market();
+        let prices = sample_prices();
+
+        let weather_probs = WProbs {
+            city: "NYC".to_string(),
+            station_icao: "KLGA".to_string(),
+            forecast_date: "2026-02-20".to_string(),
+            buckets: vec![
+                WBucket {
+                    bucket_label: "74-76".to_string(),
+                    lower: 74.0,
+                    upper: 76.0,
+                    probability: 0.35,
+                },
+                WBucket {
+                    bucket_label: "76-78".to_string(),
+                    lower: 76.0,
+                    upper: 78.0,
+                    probability: 0.30,
+                },
+            ],
+            ensemble_mean: 75.8,
+            ensemble_std: 2.3,
+            gefs_count: 31,
+            ecmwf_count: 51,
+        };
+        let wx = WeatherContext {
+            probs: &weather_probs,
+            model_probability: Some(0.35),
+        };
+        let prompt = estimator.render_prompt(&market, &prices, Some(&wx));
+
+        // Weather block should be filled in, not removed
+        assert!(!prompt.contains("{{#if weather_data}}"));
+        assert!(prompt.contains("KLGA"));
+        assert!(prompt.contains("2026-02-20"));
+        assert!(prompt.contains("75.8"));
+        assert!(prompt.contains("31 GEFS"));
+        assert!(prompt.contains("74-76"));
+        assert!(prompt.contains("35.0%"));
     }
 
     // 6. test_parse_estimate_valid_json
@@ -729,14 +875,14 @@ mod tests {
 
         // cycle_cost_so_far >= max_cost_per_cycle => should skip
         let result = estimator
-            .evaluate(&market, &prices, 0.50, 0.50)
+            .evaluate(&market, &prices, 0.50, 0.50, None)
             .await
             .unwrap();
         assert!(result.is_none());
 
         // Also test when over budget
         let result = estimator
-            .evaluate(&market, &prices, 1.00, 0.50)
+            .evaluate(&market, &prices, 1.00, 0.50, None)
             .await
             .unwrap();
         assert!(result.is_none());

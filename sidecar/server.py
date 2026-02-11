@@ -1,17 +1,21 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from polymarket_client import PolymarketClient
+from weather.open_meteo import CITY_CONFIGS, fetch_ensemble
+from weather.probability_model import compute_bucket_probabilities
 
 logger = logging.getLogger("sidecar")
 
 SIDECAR_PORT = int(os.getenv("SIDECAR_PORT", "9090"))
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
+WEATHER_SPREAD_CORRECTION = float(os.getenv("WEATHER_SPREAD_CORRECTION", "1.0"))
 
 # Global client instance — initialized at startup
 polymarket = PolymarketClient()
@@ -87,6 +91,73 @@ async def place_order(req: OrderRequest):
     except Exception as e:
         logger.error("Order placement failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class BucketResponse(BaseModel):
+    bucket_label: str
+    lower: float
+    upper: float
+    probability: float
+
+
+class WeatherResponse(BaseModel):
+    city: str
+    station_icao: str
+    forecast_date: str
+    buckets: list[BucketResponse]
+    ensemble_mean: float
+    ensemble_std: float
+    gefs_count: int
+    ecmwf_count: int
+
+
+@app.get("/weather/probabilities", response_model=WeatherResponse)
+async def weather_probabilities(city: str, date: str) -> WeatherResponse:
+    if city not in CITY_CONFIGS:
+        raise HTTPException(status_code=404, detail=f"Unknown city: {city}")
+
+    # Validate date format
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format: {date}. Expected YYYY-MM-DD",
+        )
+
+    try:
+        forecast = await fetch_ensemble(city, date)
+    except Exception as e:
+        logger.error("Weather fetch failed for %s/%s: %s", city, date, e)
+        raise HTTPException(
+            status_code=502, detail=f"Upstream weather API failed: {e}"
+        )
+
+    if forecast is None:
+        raise HTTPException(status_code=502, detail="Weather API returned no data")
+
+    probs = compute_bucket_probabilities(
+        forecast, spread_correction=WEATHER_SPREAD_CORRECTION
+    )
+
+    return WeatherResponse(
+        city=probs.city,
+        station_icao=probs.station_icao,
+        forecast_date=probs.forecast_date,
+        buckets=[
+            BucketResponse(
+                bucket_label=b.bucket_label,
+                lower=b.lower,
+                upper=b.upper,
+                probability=b.probability,
+            )
+            for b in probs.buckets
+        ],
+        ensemble_mean=probs.ensemble_mean,
+        ensemble_std=probs.ensemble_std,
+        gefs_count=probs.gefs_count,
+        ecmwf_count=probs.ecmwf_count,
+    )
 
 
 if __name__ == "__main__":

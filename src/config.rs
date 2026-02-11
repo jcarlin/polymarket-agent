@@ -63,6 +63,8 @@ pub struct Config {
     pub max_total_exposure_pct: f64,
     pub initial_bankroll: f64,
     pub executor_request_timeout_secs: u64,
+    // Weather (Phase 5)
+    pub weather_spread_correction: f64,
     // Cycle & survival (Phase 4)
     pub cycle_frequency_high_secs: u64,
     pub cycle_frequency_low_secs: u64,
@@ -163,6 +165,10 @@ impl Config {
                 .unwrap_or_else(|_| "15".to_string())
                 .parse()
                 .context("Failed to parse EXECUTOR_REQUEST_TIMEOUT_SECS")?,
+            weather_spread_correction: env::var("WEATHER_SPREAD_CORRECTION")
+                .unwrap_or_else(|_| "1.0".to_string())
+                .parse()
+                .context("Failed to parse WEATHER_SPREAD_CORRECTION")?,
             cycle_frequency_high_secs: env::var("CYCLE_FREQUENCY_HIGH_SECS")
                 .unwrap_or_else(|_| "600".to_string())
                 .parse()
@@ -209,6 +215,7 @@ mod tests {
         assert_eq!(config.min_edge_threshold, 0.08);
         assert_eq!(config.estimator_request_timeout_secs, 30);
         assert_eq!(config.estimator_max_retries, 2);
+        assert_eq!(config.weather_spread_correction, 1.0);
         assert_eq!(config.cycle_frequency_high_secs, 600);
         assert_eq!(config.cycle_frequency_low_secs, 1800);
         assert_eq!(config.low_bankroll_threshold, 200.0);
