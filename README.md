@@ -31,6 +31,8 @@ cargo build --release
 ./target/release/polymarket-agent
 ```
 
+See [docs/usage-guide.md](docs/usage-guide.md) for full setup, configuration, and deployment instructions.
+
 ## Development with Claude Code
 
 This project is designed to be built phase-by-phase with [Claude Code](https://code.claude.com).
