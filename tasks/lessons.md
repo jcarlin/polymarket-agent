@@ -13,3 +13,13 @@ Read this at the start of every session.
 - **Sidecar venv:** The Python sidecar venv lives at `sidecar/.venv/`. Phase 1 only installs the lightweight deps (fastapi, uvicorn, httpx, pytest, ruff) — heavy deps (py-clob-client, scipy, numpy) deferred until needed.
 - **Database WAL mode:** Enable WAL mode for SQLite to allow concurrent reads during writes. In-memory test DBs skip WAL since it's not needed.
 - **Sidecar startup is non-fatal:** `main.rs` catches sidecar spawn failures and continues without it. This is intentional — the agent can still scan markets without the sidecar.
+
+## Phase 2
+
+- **CLOB API returns prices as strings:** All CLOB endpoints (`/midpoint`, `/price`, `/book`) return prices as JSON strings, not numbers. Parse with `.parse::<f64>()`.
+- **Claude may fence JSON in markdown:** Claude sometimes wraps JSON output in ` ```json ... ``` ` code fences. The `parse_estimate` method must strip these before parsing.
+- **IEEE 754 float precision in tests:** `0.63 - 0.55` produces `0.07999...`, not `0.08`. Use values that compute cleanly or add epsilon tolerance in assertions.
+- **Anthropic API version header required:** Must send `anthropic-version: 2023-06-01` header or get 400 errors.
+- **Estimator gracefully handles missing API key:** When `ANTHROPIC_API_KEY` is empty, main.rs skips Claude analysis entirely rather than failing.
+- **Parallel agent coordination:** When 3+ agents modify shared files (lib.rs, config.rs), earlier agents may create stubs that later agents overwrite. Design tasks so only one agent owns each file, or accept last-write-wins for additive changes like module declarations.
+- **Team of 4 agents for Phase 2:** Streams A (config+db), B (clob_client), C (estimator) ran in parallel; Stream D (edge_detector + integration) ran after. Total wall time significantly reduced vs sequential.

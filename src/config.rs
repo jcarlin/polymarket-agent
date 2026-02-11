@@ -48,6 +48,15 @@ pub struct Config {
     pub scanner_request_timeout_secs: u64,
     // Database
     pub database_path: String,
+    // Claude API
+    pub anthropic_api_key: String,
+    pub anthropic_api_url: String,
+    pub haiku_model: String,
+    pub sonnet_model: String,
+    pub max_api_cost_per_cycle: f64,
+    pub min_edge_threshold: f64,
+    pub estimator_request_timeout_secs: u64,
+    pub estimator_max_retries: u32,
 }
 
 impl Config {
@@ -100,6 +109,29 @@ impl Config {
                 .context("Failed to parse SCANNER_REQUEST_TIMEOUT_SECS")?,
             database_path: env::var("DATABASE_PATH")
                 .unwrap_or_else(|_| "data/polymarket-agent.db".to_string()),
+            anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
+            anthropic_api_url: env::var("ANTHROPIC_API_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+            haiku_model: env::var("HAIKU_MODEL")
+                .unwrap_or_else(|_| "claude-haiku-4-5-20251001".to_string()),
+            sonnet_model: env::var("SONNET_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string()),
+            max_api_cost_per_cycle: env::var("MAX_API_COST_PER_CYCLE")
+                .unwrap_or_else(|_| "0.50".to_string())
+                .parse()
+                .context("Failed to parse MAX_API_COST_PER_CYCLE")?,
+            min_edge_threshold: env::var("MIN_EDGE_THRESHOLD")
+                .unwrap_or_else(|_| "0.08".to_string())
+                .parse()
+                .context("Failed to parse MIN_EDGE_THRESHOLD")?,
+            estimator_request_timeout_secs: env::var("ESTIMATOR_REQUEST_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .context("Failed to parse ESTIMATOR_REQUEST_TIMEOUT_SECS")?,
+            estimator_max_retries: env::var("ESTIMATOR_MAX_RETRIES")
+                .unwrap_or_else(|_| "2".to_string())
+                .parse()
+                .context("Failed to parse ESTIMATOR_MAX_RETRIES")?,
         })
     }
 
@@ -123,6 +155,13 @@ mod tests {
         assert_eq!(config.scanner_page_size, 50);
         assert_eq!(config.scanner_min_liquidity, 500.0);
         assert_eq!(config.database_path, "data/polymarket-agent.db");
+        assert_eq!(config.anthropic_api_url, "https://api.anthropic.com");
+        assert_eq!(config.haiku_model, "claude-haiku-4-5-20251001");
+        assert_eq!(config.sonnet_model, "claude-sonnet-4-5-20250929");
+        assert_eq!(config.max_api_cost_per_cycle, 0.50);
+        assert_eq!(config.min_edge_threshold, 0.08);
+        assert_eq!(config.estimator_request_timeout_secs, 30);
+        assert_eq!(config.estimator_max_retries, 2);
     }
 
     #[test]

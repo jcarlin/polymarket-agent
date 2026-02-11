@@ -40,6 +40,48 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_api_cost(
+        &self,
+        cycle_number: i64,
+        market_condition_id: Option<&str>,
+        model: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: f64,
+        call_type: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO api_cost_log (cycle_number, market_condition_id, model, input_tokens, output_tokens, cost_usd, call_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![cycle_number, market_condition_id, model, input_tokens as i64, output_tokens as i64, cost_usd, call_type],
+        ).context("Failed to log API cost")?;
+        Ok(())
+    }
+
+    pub fn get_cycle_api_cost(&self, cycle_number: i64) -> Result<f64> {
+        let cost: f64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_cost_log WHERE cycle_number = ?1",
+                [cycle_number],
+                |row| row.get(0),
+            )
+            .context("Failed to get cycle API cost")?;
+        Ok(cost)
+    }
+
+    pub fn get_api_cost_since(&self, hours: u32) -> Result<f64> {
+        let cost: f64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM api_cost_log WHERE created_at >= datetime('now', ?1)",
+                [format!("-{} hours", hours)],
+                |row| row.get(0),
+            )
+            .context("Failed to get API cost since")?;
+        Ok(cost)
+    }
+
     fn run_migrations(&self) -> Result<()> {
         self.conn
             .execute_batch(
@@ -110,6 +152,18 @@ impl Database {
                 bankroll_after REAL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS api_cost_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_number INTEGER,
+                market_condition_id TEXT,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL,
+                call_type TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             ",
             )
             .context("Failed to run database migrations")?;
@@ -125,7 +179,7 @@ mod tests {
     #[test]
     fn test_open_in_memory() {
         let db = Database::open_in_memory().unwrap();
-        // Verify all 5 tables exist
+        // Verify all 6 tables exist
         let tables: Vec<String> = db
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -140,6 +194,7 @@ mod tests {
         assert!(tables.contains(&"positions".to_string()));
         assert!(tables.contains(&"bankroll_log".to_string()));
         assert!(tables.contains(&"cycle_log".to_string()));
+        assert!(tables.contains(&"api_cost_log".to_string()));
     }
 
     #[test]
@@ -203,5 +258,56 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         // Running migrations again should not fail
         db.run_migrations().unwrap();
+    }
+
+    #[test]
+    fn test_log_and_get_api_cost() {
+        let db = Database::open_in_memory().unwrap();
+        db.log_api_cost(
+            1,
+            Some("0xabc"),
+            "claude-haiku-4-5-20251001",
+            500,
+            50,
+            0.00075,
+            "triage",
+        )
+        .unwrap();
+        db.log_api_cost(
+            1,
+            Some("0xabc"),
+            "claude-sonnet-4-5-20250929",
+            2000,
+            200,
+            0.009,
+            "analysis",
+        )
+        .unwrap();
+        let cost = db.get_cycle_api_cost(1).unwrap();
+        assert!((cost - 0.00975).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_get_cycle_api_cost_empty() {
+        let db = Database::open_in_memory().unwrap();
+        let cost = db.get_cycle_api_cost(99).unwrap();
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn test_get_api_cost_since() {
+        let db = Database::open_in_memory().unwrap();
+        db.log_api_cost(
+            1,
+            None,
+            "claude-haiku-4-5-20251001",
+            500,
+            50,
+            0.001,
+            "triage",
+        )
+        .unwrap();
+        let cost = db.get_api_cost_since(1).unwrap();
+        assert!(cost > 0.0);
     }
 }

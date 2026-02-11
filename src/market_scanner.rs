@@ -240,6 +240,14 @@ mod tests {
             scanner_min_volume: 1000.0,
             scanner_request_timeout_secs: 5,
             database_path: ":memory:".to_string(),
+            anthropic_api_key: "test-key".to_string(),
+            anthropic_api_url: String::new(),
+            haiku_model: "claude-haiku-4-5-20251001".to_string(),
+            sonnet_model: "claude-sonnet-4-5-20250929".to_string(),
+            max_api_cost_per_cycle: 0.50,
+            min_edge_threshold: 0.08,
+            estimator_request_timeout_secs: 30,
+            estimator_max_retries: 2,
         }
     }
 
