@@ -1,6 +1,6 @@
 # Polymarket Autonomous Trading Agent
 
-## Current Phase: Phase 2 — Claude Analysis Engine & Edge Detection
+## Current Phase: Phase 3 — Position Sizing & Execution
 
 Build this project phase by phase. Do NOT skip ahead. Complete each phase fully,
 ensure all tests pass and `cargo build` succeeds, then STOP and let me review
