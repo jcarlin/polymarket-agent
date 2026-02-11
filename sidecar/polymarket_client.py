@@ -1,12 +1,11 @@
 """Polymarket CLOB client wrapper for the Python sidecar.
 
 Handles order signing and placement via py-clob-client.
-Phase 1: scaffold only — trading methods added in Phase 3.
 """
 
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("sidecar.polymarket_client")
 
@@ -61,3 +60,44 @@ class PolymarketClient:
     def client(self) -> Optional[object]:
         """Access the underlying ClobClient. None if not initialized."""
         return self._client
+
+    def place_order(
+        self, token_id: str, price: float, size: float, side: str
+    ) -> dict[str, Any]:
+        """Place a limit order on the CLOB.
+
+        Args:
+            token_id: The token to trade.
+            price: Limit price (0-1).
+            size: Number of shares.
+            side: "BUY" or "SELL".
+
+        Returns:
+            Dict with order_id and status.
+
+        Raises:
+            RuntimeError: If client is not initialized.
+        """
+        if not self._initialized or self._client is None:
+            raise RuntimeError("Polymarket client not initialized")
+
+        from py_clob_client.order import OrderArgs
+
+        order_args = OrderArgs(
+            price=price,
+            size=size,
+            side=side,
+            token_id=token_id,
+        )
+
+        signed_order = self._client.create_order(order_args)
+        response = self._client.post_order(signed_order, order_type="GTC")
+
+        order_id = response.get("orderID", response.get("order_id", "unknown"))
+        status = response.get("status", "submitted")
+
+        logger.info(
+            "Order placed: %s %s %.4f @ %.4f → %s (%s)",
+            side, token_id[:12], size, price, order_id, status,
+        )
+        return {"order_id": order_id, "status": status}

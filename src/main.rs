@@ -4,10 +4,29 @@ use tracing::{error, info, warn};
 use polymarket_agent::clob_client::ClobClient;
 use polymarket_agent::config::Config;
 use polymarket_agent::db::Database;
-use polymarket_agent::edge_detector::EdgeDetector;
+use polymarket_agent::edge_detector::{EdgeDetector, TradeSide};
 use polymarket_agent::estimator::Estimator;
-use polymarket_agent::market_scanner::MarketScanner;
+use polymarket_agent::executor::{Executor, TradeIntent};
+use polymarket_agent::market_scanner::{GammaMarket, MarketScanner};
+use polymarket_agent::position_sizer::PositionSizer;
 use polymarket_agent::sidecar::SidecarProcess;
+
+/// Look up the token_id for a given market condition_id and trade side.
+fn find_token_id(markets: &[GammaMarket], condition_id: &str, side: &TradeSide) -> Option<String> {
+    let target_outcome = match side {
+        TradeSide::Yes => "Yes",
+        TradeSide::No => "No",
+    };
+    markets
+        .iter()
+        .find(|m| m.condition_id.as_deref() == Some(condition_id))
+        .and_then(|m| {
+            m.tokens
+                .iter()
+                .find(|t| t.outcome == target_outcome)
+                .map(|t| t.token_id.clone())
+        })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -148,10 +167,71 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Step 5: Log cycle summary
+    // Step 5: Position sizing & execution (Phase 3)
+    let position_sizer = PositionSizer::new(
+        config.kelly_fraction,
+        config.max_position_pct,
+        config.max_total_exposure_pct,
+    );
+    let executor = Executor::new(
+        &config.sidecar_url(),
+        config.trading_mode.clone(),
+        config.executor_request_timeout_secs,
+    )?;
+
+    // Seed bankroll if first run
+    db.ensure_bankroll_seeded(config.initial_bankroll)?;
+    let mut bankroll = db.get_current_bankroll()?;
+    let mut current_exposure = db.get_total_exposure()?;
+    let mut trades_placed = 0u32;
+
+    for opp in &opportunities {
+        // Look up the token_id from the market data
+        let token_id = match find_token_id(&markets, &opp.market_id, &opp.side) {
+            Some(id) => id,
+            None => {
+                warn!("No token_id found for {} side of {}", opp.side, opp.market_id);
+                continue;
+            }
+        };
+
+        let sizing = position_sizer.size_position(opp, bankroll, current_exposure);
+        if sizing.is_rejected() {
+            info!(
+                "Skipping {}: {}",
+                opp.question,
+                sizing.reject_reason.as_deref().unwrap_or("unknown"),
+            );
+            continue;
+        }
+
+        let intent = TradeIntent {
+            opportunity: opp.clone(),
+            token_id,
+            sizing: sizing.clone(),
+        };
+
+        match executor.execute(&intent, &db).await {
+            Ok(result) => {
+                trades_placed += 1;
+                bankroll = db.get_current_bankroll()?;
+                current_exposure = db.get_total_exposure()?;
+                info!(
+                    "Trade #{}: {} {} @ {:.2} (${:.2}), bankroll=${:.2}",
+                    trades_placed, result.side, result.market_condition_id,
+                    result.price, sizing.position_usd, bankroll,
+                );
+            }
+            Err(e) => {
+                warn!("Trade execution failed for '{}': {}", opp.question, e);
+            }
+        }
+    }
+
+    // Step 6: Log cycle summary
     if let Err(e) = db.conn.execute(
-        "INSERT INTO cycle_log (cycle_number, markets_scanned, markets_filtered, trades_placed, api_cost_usd) VALUES (?1, ?2, ?3, 0, ?4)",
-        rusqlite::params![1, markets.len() as i64, analyses.len() as i64, cycle_cost],
+        "INSERT INTO cycle_log (cycle_number, markets_scanned, markets_filtered, trades_placed, api_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![1, markets.len() as i64, analyses.len() as i64, trades_placed as i64, cycle_cost],
     ) {
         warn!("Failed to log cycle summary: {}", e);
     }
@@ -161,9 +241,11 @@ async fn main() -> Result<()> {
         s.shutdown();
     }
     info!(
-        "Phase 2 cycle complete. {} opportunities found from {} markets.",
+        "Phase 3 cycle complete. {} trades from {} opportunities from {} markets. Bankroll: ${:.2}",
+        trades_placed,
         opportunities.len(),
         markets.len(),
+        bankroll,
     );
 
     Ok(())

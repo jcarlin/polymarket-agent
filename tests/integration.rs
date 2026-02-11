@@ -54,3 +54,82 @@ fn test_edge_detector_basic() {
     assert!(opp.is_some());
     assert!((opp.unwrap().edge - 0.20).abs() < 0.001);
 }
+
+#[test]
+fn test_position_sizer_kelly_basic() {
+    use polymarket_agent::edge_detector::{EdgeOpportunity, TradeSide};
+    use polymarket_agent::position_sizer::PositionSizer;
+
+    let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+    let opp = EdgeOpportunity {
+        market_id: "0xtest".to_string(),
+        question: "Test?".to_string(),
+        side: TradeSide::Yes,
+        estimated_probability: 0.75,
+        market_price: 0.55,
+        edge: 0.20,
+        confidence: 0.85,
+        data_quality: "high".to_string(),
+        reasoning: "Test".to_string(),
+        analysis_cost: 0.01,
+    };
+
+    let result = sizer.size_position(&opp, 50.0, 0.0);
+    assert!(!result.is_rejected());
+    assert!(result.position_usd > 0.0);
+    assert!(result.position_usd <= 3.0); // max 6% of 50
+}
+
+#[tokio::test]
+async fn test_paper_trade_end_to_end() {
+    use polymarket_agent::config::TradingMode;
+    use polymarket_agent::edge_detector::{EdgeOpportunity, TradeSide};
+    use polymarket_agent::executor::{Executor, TradeIntent};
+    use polymarket_agent::position_sizer::PositionSizer;
+
+    let db = Database::open_in_memory().unwrap();
+    // Insert market for FK
+    db.conn
+        .execute(
+            "INSERT INTO markets (condition_id, question, active) VALUES ('0xe2e', 'E2E test?', 1)",
+            [],
+        )
+        .unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+
+    let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+    let opp = EdgeOpportunity {
+        market_id: "0xe2e".to_string(),
+        question: "E2E test?".to_string(),
+        side: TradeSide::Yes,
+        estimated_probability: 0.75,
+        market_price: 0.55,
+        edge: 0.20,
+        confidence: 0.85,
+        data_quality: "high".to_string(),
+        reasoning: "Test".to_string(),
+        analysis_cost: 0.01,
+    };
+
+    let sizing = sizer.size_position(&opp, 50.0, 0.0);
+    assert!(!sizing.is_rejected());
+
+    let executor =
+        Executor::new("http://unused:9999", TradingMode::Paper, 5).unwrap();
+    let intent = TradeIntent {
+        opportunity: opp,
+        token_id: "tok_yes_e2e".to_string(),
+        sizing,
+    };
+    let result = executor.execute(&intent, &db).await.unwrap();
+    assert!(result.paper);
+    assert_eq!(result.status, "filled");
+
+    // Verify bankroll decreased
+    let bankroll = db.get_current_bankroll().unwrap();
+    assert!(bankroll < 50.0);
+
+    // Verify position created
+    let positions = db.get_open_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+}

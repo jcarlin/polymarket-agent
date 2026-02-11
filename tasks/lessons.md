@@ -23,3 +23,9 @@ Read this at the start of every session.
 - **Estimator gracefully handles missing API key:** When `ANTHROPIC_API_KEY` is empty, main.rs skips Claude analysis entirely rather than failing.
 - **Parallel agent coordination:** When 3+ agents modify shared files (lib.rs, config.rs), earlier agents may create stubs that later agents overwrite. Design tasks so only one agent owns each file, or accept last-write-wins for additive changes like module declarations.
 - **Team of 4 agents for Phase 2:** Streams A (config+db), B (clob_client), C (estimator) ran in parallel; Stream D (edge_detector + integration) ran after. Total wall time significantly reduced vs sequential.
+
+## Phase 3
+
+- **SQLite foreign key enforcement is ON:** The `trades` and `positions` tables have FK constraints referencing `markets(condition_id)`. Test code must insert a market row first before inserting trades/positions, or the INSERT will fail with "FOREIGN KEY constraint failed".
+- **Kelly formula for binary markets:** `(win_prob - buy_price) / (1 - buy_price)` where `buy_price = market_price` for YES, `1 - market_price` for NO. Simple and correct — no need for the more complex multi-outcome Kelly.
+- **Paper mode needs no sidecar:** Paper execution generates a UUID, logs to DB, updates bankroll — all in-process. Live mode just adds one HTTP POST to sidecar before the same DB writes. This separation keeps testing fast and isolated.

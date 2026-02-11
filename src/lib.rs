@@ -3,5 +3,7 @@ pub mod config;
 pub mod db;
 pub mod edge_detector;
 pub mod estimator;
+pub mod executor;
 pub mod market_scanner;
+pub mod position_sizer;
 pub mod sidecar;

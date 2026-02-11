@@ -57,6 +57,12 @@ pub struct Config {
     pub min_edge_threshold: f64,
     pub estimator_request_timeout_secs: u64,
     pub estimator_max_retries: u32,
+    // Position sizing & execution (Phase 3)
+    pub kelly_fraction: f64,
+    pub max_position_pct: f64,
+    pub max_total_exposure_pct: f64,
+    pub initial_bankroll: f64,
+    pub executor_request_timeout_secs: u64,
 }
 
 impl Config {
@@ -132,6 +138,26 @@ impl Config {
                 .unwrap_or_else(|_| "2".to_string())
                 .parse()
                 .context("Failed to parse ESTIMATOR_MAX_RETRIES")?,
+            kelly_fraction: env::var("KELLY_FRACTION")
+                .unwrap_or_else(|_| "0.5".to_string())
+                .parse()
+                .context("Failed to parse KELLY_FRACTION")?,
+            max_position_pct: env::var("MAX_POSITION_PCT")
+                .unwrap_or_else(|_| "0.06".to_string())
+                .parse()
+                .context("Failed to parse MAX_POSITION_PCT")?,
+            max_total_exposure_pct: env::var("MAX_TOTAL_EXPOSURE_PCT")
+                .unwrap_or_else(|_| "0.40".to_string())
+                .parse()
+                .context("Failed to parse MAX_TOTAL_EXPOSURE_PCT")?,
+            initial_bankroll: env::var("INITIAL_BANKROLL")
+                .unwrap_or_else(|_| "50.0".to_string())
+                .parse()
+                .context("Failed to parse INITIAL_BANKROLL")?,
+            executor_request_timeout_secs: env::var("EXECUTOR_REQUEST_TIMEOUT_SECS")
+                .unwrap_or_else(|_| "15".to_string())
+                .parse()
+                .context("Failed to parse EXECUTOR_REQUEST_TIMEOUT_SECS")?,
         })
     }
 

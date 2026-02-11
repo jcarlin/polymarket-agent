@@ -248,6 +248,11 @@ mod tests {
             min_edge_threshold: 0.08,
             estimator_request_timeout_secs: 30,
             estimator_max_retries: 2,
+            kelly_fraction: 0.5,
+            max_position_pct: 0.06,
+            max_total_exposure_pct: 0.40,
+            initial_bankroll: 50.0,
+            executor_request_timeout_secs: 15,
         }
     }
 

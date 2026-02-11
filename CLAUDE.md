@@ -1,6 +1,6 @@
 # Polymarket Autonomous Trading Agent
 
-## Current Phase: Phase 3 — Position Sizing & Execution
+## Current Phase: Phase 4 — Accounting & Survival
 
 Build this project phase by phase. Do NOT skip ahead. Complete each phase fully,
 ensure all tests pass and `cargo build` succeeds, then STOP and let me review
