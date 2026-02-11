@@ -1,11 +1,13 @@
 pub mod accounting;
 pub mod clob_client;
 pub mod config;
+pub mod data_sources;
 pub mod db;
 pub mod edge_detector;
 pub mod estimator;
 pub mod executor;
 pub mod market_scanner;
+pub mod position_manager;
 pub mod position_sizer;
 pub mod sidecar;
 pub mod weather_client;

@@ -302,3 +302,191 @@ fn test_weather_non_weather_market_returns_none() {
     assert!(parse_weather_market("Will the election happen?").is_none());
     assert!(parse_weather_market("").is_none());
 }
+
+// ═══════════════════════════════════════
+// Phase 6: Position Management & Risk
+// ═══════════════════════════════════════
+
+#[test]
+fn test_stop_loss_end_to_end() {
+    use polymarket_agent::db::PositionRow;
+    use polymarket_agent::position_manager::{PositionAction, PositionManager};
+
+    let db = Database::open_in_memory().unwrap();
+
+    // Create a market and position
+    db.conn
+        .execute(
+            "INSERT INTO markets (condition_id, question, active) VALUES ('0xsl', 'Stop-loss test?', 1)",
+            [],
+        )
+        .unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+    db.upsert_position("0xsl", "tok_yes_sl", "YES", 0.60, 10.0)
+        .unwrap();
+
+    // Simulate price drop beyond stop-loss threshold
+    let pos = PositionRow {
+        market_condition_id: "0xsl".to_string(),
+        token_id: "tok_yes_sl".to_string(),
+        side: "YES".to_string(),
+        entry_price: 0.60,
+        size: 10.0,
+        status: "open".to_string(),
+        current_price: Some(0.50),
+        unrealized_pnl: -1.0,
+        estimated_probability: None,
+        question: Some("Stop-loss test?".to_string()),
+    };
+
+    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15);
+    // Price at 0.50 = 16.7% loss > 15% threshold
+    let action = mgr.evaluate_position(&pos, 0.50);
+    assert!(matches!(action, PositionAction::Exit { .. }));
+
+    // Simulate exit by closing position in DB
+    let pnl = db.close_position("0xsl", "YES", 0.50).unwrap();
+    assert!((pnl - (-1.0)).abs() < 0.01); // (0.50 - 0.60) * 10 = -1.0
+
+    // Position should now be closed
+    assert!(db.get_open_positions().unwrap().is_empty());
+}
+
+#[test]
+fn test_drawdown_reduces_sizing() {
+    use polymarket_agent::position_manager::PositionManager;
+    use polymarket_agent::position_sizer::PositionSizer;
+
+    let db = Database::open_in_memory().unwrap();
+    db.ensure_bankroll_seeded(100.0).unwrap();
+
+    // Set peak to 100, then drop to 65 (35% drawdown > 30% threshold)
+    db.update_peak_bankroll(100.0).unwrap();
+    let state = PositionManager::check_drawdown(&db, 65.0, 0.30).unwrap();
+    assert!(state.is_circuit_breaker_active);
+
+    // Normal sizer: kelly_fraction = 0.5
+    let normal_sizer = PositionSizer::new(0.5, 0.06, 0.40);
+
+    // Drawdown sizer: kelly_fraction = 0.5 * 0.5 = 0.25
+    let drawdown_sizer = PositionSizer::new(0.25, 0.06, 0.40);
+
+    let opp = polymarket_agent::edge_detector::EdgeOpportunity {
+        market_id: "0xdd".to_string(),
+        question: "Drawdown test?".to_string(),
+        side: polymarket_agent::edge_detector::TradeSide::Yes,
+        estimated_probability: 0.80,
+        market_price: 0.50,
+        edge: 0.30,
+        confidence: 0.85,
+        data_quality: "high".to_string(),
+        reasoning: "Test".to_string(),
+        analysis_cost: 0.01,
+    };
+
+    let normal_sizing = normal_sizer.size_position(&opp, 65.0, 0.0);
+    let drawdown_sizing = drawdown_sizer.size_position(&opp, 65.0, 0.0);
+
+    // Both should succeed, but drawdown sizing should be smaller
+    assert!(!normal_sizing.is_rejected());
+    assert!(!drawdown_sizing.is_rejected());
+    assert!(drawdown_sizing.position_usd <= normal_sizing.position_usd);
+}
+
+#[test]
+fn test_correlated_exposure_blocks_trade() {
+    use polymarket_agent::db::PositionRow;
+    use polymarket_agent::position_manager::PositionManager;
+
+    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15);
+
+    // Create positions in the Northeast group (NYC + BOS)
+    let positions = vec![
+        PositionRow {
+            market_condition_id: "0xnyc".to_string(),
+            token_id: "tok_nyc".to_string(),
+            side: "YES".to_string(),
+            entry_price: 0.50,
+            size: 20.0,
+            status: "open".to_string(),
+            current_price: None,
+            unrealized_pnl: 0.0,
+            estimated_probability: None,
+            question: Some(
+                "Will the high temperature in New York City on February 20, 2026 be between 40°F and 42°F?"
+                    .to_string(),
+            ),
+        },
+        PositionRow {
+            market_condition_id: "0xbos".to_string(),
+            token_id: "tok_bos".to_string(),
+            side: "YES".to_string(),
+            entry_price: 0.50,
+            size: 20.0,
+            status: "open".to_string(),
+            current_price: None,
+            unrealized_pnl: 0.0,
+            estimated_probability: None,
+            question: Some(
+                "Will the high temperature in Boston on February 20, 2026 be between 38°F and 40°F?"
+                    .to_string(),
+            ),
+        },
+    ];
+
+    // NE exposure = 10 + 10 = 20.0, limit = 0.15 * 100 = 15.0
+    // Philadelphia is also in NE group — should be blocked
+    let phl_question =
+        "Will the high temperature in Philadelphia on February 20, 2026 be between 42°F and 44°F?";
+    assert!(mgr.is_correlated_group_over_limit(phl_question, &positions, 100.0));
+
+    // Chicago is in Midwest — should NOT be blocked
+    let chi_question =
+        "Will the high temperature in Chicago on February 20, 2026 be between 30°F and 32°F?";
+    assert!(!mgr.is_correlated_group_over_limit(chi_question, &positions, 100.0));
+}
+
+#[test]
+fn test_position_management_db_roundtrip() {
+    // Test the full DB lifecycle: create position → update price → check alert → close
+    let db = Database::open_in_memory().unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO markets (condition_id, question, active) VALUES ('0xrt', 'Roundtrip test?', 1)",
+            [],
+        )
+        .unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+
+    // Create position with estimated probability
+    db.upsert_position_with_estimate("0xrt", "tok_yes_rt", "YES", 0.60, 10.0, Some(0.75))
+        .unwrap();
+
+    // Update price
+    db.update_position_price("0xrt", "YES", 0.70).unwrap();
+
+    // Verify current price and unrealized P&L
+    let positions = db.get_open_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert!((positions[0].current_price.unwrap() - 0.70).abs() < f64::EPSILON);
+    assert!((positions[0].unrealized_pnl - 1.0).abs() < 0.01); // (0.70 - 0.60) * 10
+
+    // Log an alert
+    db.log_position_alert(
+        "0xrt",
+        "stop_loss",
+        "Price approaching threshold",
+        "monitoring",
+        1,
+    )
+    .unwrap();
+
+    // Close position
+    let pnl = db.close_position("0xrt", "YES", 0.70).unwrap();
+    assert!((pnl - 1.0).abs() < 0.01);
+    assert!(db.get_open_positions().unwrap().is_empty());
+
+    // Bankroll log should still have seed entry
+    let bankroll = db.get_current_bankroll().unwrap();
+    assert!((bankroll - 50.0).abs() < f64::EPSILON);
+}

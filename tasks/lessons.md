@@ -45,3 +45,12 @@ Read this at the start of every session.
 - **HashMap entry API for clippy.** Using `contains_key()` + `insert()` triggers clippy's `map_entry` lint. Use `Entry::Vacant(entry)` pattern instead.
 - **`parse_weather_market` is best-effort regex.** If it can't parse the question, returns None and the market goes through normal non-weather analysis. No trades are missed.
 - **Parallel Python + Rust agent streams work well.** Phase 5 used 3 streams: Python sidecar (weather module + endpoint), Rust (weather_client + config), Integration (estimator + main.rs). Python and Rust ran in parallel, integration after both completed.
+
+## Phase 6
+
+- **f64 boundary tests need epsilon slack.** `0.45/0.50 = 0.8999...` not `0.90`, so `>= 0.90` fails at exact boundary. Use values like `0.951` instead of `0.95` to avoid IEEE 754 precision traps in threshold tests. Same pattern as Phase 2 lesson but easy to forget.
+- **`map_or(false, ...)` → `is_some_and(...)`:** Clippy now flags the older pattern. Use `is_some_and()` for cleaner Option/Result boolean checks.
+- **`new()` requires `Default` impl.** If a struct has `pub fn new() -> Self` with no args, clippy demands `impl Default`. Add it or derive it.
+- **Drawdown-adjusted sizing in main loop.** When drawdown circuit breaker is active, construct a *new* `PositionSizer` with reduced `kelly_fraction` (`kelly * drawdown_reduction`). The original sizer stays available for when drawdown clears.
+- **Position exit reuses `/order` endpoint.** No new sidecar endpoint needed — existing `/order` with side="SELL" handles exits. Keep the sidecar surface area minimal.
+- **`ALTER TABLE ADD COLUMN` for existing tables.** Wrap in `let _ =` to make idempotent — SQLite errors if column already exists. This pattern works for incremental migrations without a migration framework.

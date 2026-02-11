@@ -22,6 +22,10 @@ pub struct PositionRow {
     pub entry_price: f64,
     pub size: f64,
     pub status: String,
+    pub current_price: Option<f64>,
+    pub unrealized_pnl: f64,
+    pub estimated_probability: Option<f64>,
+    pub question: Option<String>,
 }
 
 pub struct Database {
@@ -198,7 +202,7 @@ impl Database {
 
     pub fn get_open_positions(&self) -> Result<Vec<PositionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT market_condition_id, token_id, side, entry_price, size, status FROM positions WHERE status = 'open'",
+            "SELECT market_condition_id, token_id, side, entry_price, size, status, current_price, unrealized_pnl, estimated_probability FROM positions WHERE status = 'open'",
         ).context("Failed to prepare open positions query")?;
         let rows = stmt
             .query_map([], |row| {
@@ -209,6 +213,10 @@ impl Database {
                     entry_price: row.get(3)?,
                     size: row.get(4)?,
                     status: row.get(5)?,
+                    current_price: row.get(6)?,
+                    unrealized_pnl: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                    estimated_probability: row.get(8)?,
+                    question: None,
                 })
             })
             .context("Failed to query open positions")?;
@@ -217,6 +225,201 @@ impl Database {
             positions.push(row.context("Failed to read position row")?);
         }
         Ok(positions)
+    }
+
+    /// Get open positions with market question text (JOIN with markets table).
+    pub fn get_open_positions_with_market(&self) -> Result<Vec<PositionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.market_condition_id, p.token_id, p.side, p.entry_price, p.size, p.status, \
+             p.current_price, p.unrealized_pnl, p.estimated_probability, m.question \
+             FROM positions p \
+             LEFT JOIN markets m ON p.market_condition_id = m.condition_id \
+             WHERE p.status = 'open'",
+        ).context("Failed to prepare open positions with market query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PositionRow {
+                    market_condition_id: row.get(0)?,
+                    token_id: row.get(1)?,
+                    side: row.get(2)?,
+                    entry_price: row.get(3)?,
+                    size: row.get(4)?,
+                    status: row.get(5)?,
+                    current_price: row.get(6)?,
+                    unrealized_pnl: row.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                    estimated_probability: row.get(8)?,
+                    question: row.get(9)?,
+                })
+            })
+            .context("Failed to query open positions with market")?;
+        let mut positions = Vec::new();
+        for row in rows {
+            positions.push(row.context("Failed to read position row")?);
+        }
+        Ok(positions)
+    }
+
+    /// Update the current price for an open position and recompute unrealized P&L.
+    pub fn update_position_price(
+        &self,
+        market_condition_id: &str,
+        side: &str,
+        current_price: f64,
+    ) -> Result<()> {
+        // For YES positions: pnl = (current - entry) * size
+        // For NO positions: pnl = (entry - current) * size (we profit when price drops)
+        // Actually in binary markets: pnl = (current_value - cost) where cost = entry_price * size
+        // YES: value = current_price * size, cost = entry_price * size
+        // NO: value = (1 - current_price) * size, cost = (1 - entry_price) is already entry_price for NO
+        // Simpler: unrealized_pnl = (current_price - entry_price) * size for any side
+        // since entry_price already accounts for side (buy_price)
+        self.conn
+            .execute(
+                "UPDATE positions SET current_price = ?1, \
+             unrealized_pnl = (?1 - entry_price) * size, \
+             updated_at = datetime('now') \
+             WHERE market_condition_id = ?2 AND side = ?3 AND status = 'open'",
+                rusqlite::params![current_price, market_condition_id, side],
+            )
+            .context("Failed to update position price")?;
+        Ok(())
+    }
+
+    /// Close an open position. Sets status='closed' and returns realized P&L.
+    pub fn close_position(
+        &self,
+        market_condition_id: &str,
+        side: &str,
+        exit_price: f64,
+    ) -> Result<f64> {
+        // Get the position details first
+        let (entry_price, size): (f64, f64) = self
+            .conn
+            .query_row(
+                "SELECT entry_price, size FROM positions WHERE market_condition_id = ?1 AND side = ?2 AND status = 'open'",
+                rusqlite::params![market_condition_id, side],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("Failed to find open position to close")?;
+
+        let realized_pnl = (exit_price - entry_price) * size;
+
+        self.conn
+            .execute(
+                "UPDATE positions SET status = 'closed', current_price = ?1, \
+             realized_pnl = ?2, unrealized_pnl = 0.0, updated_at = datetime('now') \
+             WHERE market_condition_id = ?3 AND side = ?4 AND status = 'open'",
+                rusqlite::params![exit_price, realized_pnl, market_condition_id, side],
+            )
+            .context("Failed to close position")?;
+
+        Ok(realized_pnl)
+    }
+
+    /// Get or update the peak bankroll. Returns the (possibly updated) peak.
+    pub fn update_peak_bankroll(&self, current: f64) -> Result<f64> {
+        let existing_peak: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT peak_value FROM peak_bankroll ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let peak = match existing_peak {
+            Some(p) if current > p => {
+                self.conn
+                    .execute(
+                        "INSERT INTO peak_bankroll (peak_value) VALUES (?1)",
+                        [current],
+                    )
+                    .context("Failed to insert new peak")?;
+                current
+            }
+            Some(p) => p,
+            None => {
+                self.conn
+                    .execute(
+                        "INSERT INTO peak_bankroll (peak_value) VALUES (?1)",
+                        [current],
+                    )
+                    .context("Failed to insert initial peak")?;
+                current
+            }
+        };
+
+        Ok(peak)
+    }
+
+    /// Get the current peak bankroll without updating.
+    pub fn get_peak_bankroll(&self) -> Result<f64> {
+        let peak: f64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE((SELECT peak_value FROM peak_bankroll ORDER BY id DESC LIMIT 1), 0.0)",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to get peak bankroll")?;
+        Ok(peak)
+    }
+
+    /// Log a position management alert.
+    pub fn log_position_alert(
+        &self,
+        market_condition_id: &str,
+        alert_type: &str,
+        details: &str,
+        action_taken: &str,
+        cycle_number: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO position_alerts (market_condition_id, alert_type, details, action_taken, cycle_number) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![market_condition_id, alert_type, details, action_taken, cycle_number],
+        ).context("Failed to log position alert")?;
+        Ok(())
+    }
+
+    /// Upsert a position with optional estimated_probability.
+    pub fn upsert_position_with_estimate(
+        &self,
+        market_condition_id: &str,
+        token_id: &str,
+        side: &str,
+        entry_price: f64,
+        size: f64,
+        estimated_probability: Option<f64>,
+    ) -> Result<()> {
+        // Check if an open position already exists for this market/side
+        let existing: Option<(i64, f64, f64)> = self
+            .conn
+            .query_row(
+                "SELECT id, entry_price, size FROM positions WHERE market_condition_id = ?1 AND side = ?2 AND status = 'open'",
+                rusqlite::params![market_condition_id, side],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        if let Some((id, old_price, old_size)) = existing {
+            let total_size = old_size + size;
+            let avg_price = (old_price * old_size + entry_price * size) / total_size;
+            self.conn
+                .execute(
+                    "UPDATE positions SET entry_price = ?1, size = ?2, token_id = ?3, \
+                 estimated_probability = COALESCE(?4, estimated_probability), \
+                 updated_at = datetime('now') WHERE id = ?5",
+                    rusqlite::params![avg_price, total_size, token_id, estimated_probability, id],
+                )
+                .context("Failed to update position with estimate")?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO positions (market_condition_id, token_id, side, entry_price, size, status, estimated_probability) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6)",
+                rusqlite::params![market_condition_id, token_id, side, entry_price, size, estimated_probability],
+            ).context("Failed to insert position with estimate")?;
+        }
+        Ok(())
     }
 
     pub fn get_next_cycle_number(&self) -> Result<i64> {
@@ -360,9 +563,31 @@ impl Database {
                 call_type TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS peak_bankroll (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peak_value REAL NOT NULL,
+                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS position_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_condition_id TEXT NOT NULL,
+                alert_type TEXT NOT NULL,
+                details TEXT,
+                action_taken TEXT,
+                cycle_number INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             ",
             )
             .context("Failed to run database migrations")?;
+
+        // Phase 6: Add estimated_probability column to positions (idempotent)
+        let _ = self.conn.execute(
+            "ALTER TABLE positions ADD COLUMN estimated_probability REAL",
+            [],
+        );
 
         Ok(())
     }
@@ -671,6 +896,123 @@ mod tests {
         db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true)
             .unwrap();
         assert_eq!(db.get_total_trades_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_peak_bankroll_tracking() {
+        let db = Database::open_in_memory().unwrap();
+        // First call sets initial peak
+        let peak = db.update_peak_bankroll(50.0).unwrap();
+        assert!((peak - 50.0).abs() < f64::EPSILON);
+
+        // Higher value updates peak
+        let peak = db.update_peak_bankroll(75.0).unwrap();
+        assert!((peak - 75.0).abs() < f64::EPSILON);
+
+        // Lower value doesn't update peak
+        let peak = db.update_peak_bankroll(60.0).unwrap();
+        assert!((peak - 75.0).abs() < f64::EPSILON);
+
+        // Get peak without updating
+        let peak = db.get_peak_bankroll().unwrap();
+        assert!((peak - 75.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_peak_bankroll_empty() {
+        let db = Database::open_in_memory().unwrap();
+        let peak = db.get_peak_bankroll().unwrap();
+        assert!((peak - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_update_position_price() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        db.upsert_position("0xcond1", "tok1", "YES", 0.60, 10.0)
+            .unwrap();
+
+        db.update_position_price("0xcond1", "YES", 0.75).unwrap();
+
+        let positions = db.get_open_positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert!((positions[0].current_price.unwrap() - 0.75).abs() < f64::EPSILON);
+        // pnl = (0.75 - 0.60) * 10 = 1.50
+        assert!((positions[0].unrealized_pnl - 1.50).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_close_position() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        db.upsert_position("0xcond1", "tok1", "YES", 0.60, 10.0)
+            .unwrap();
+
+        let pnl = db.close_position("0xcond1", "YES", 0.80).unwrap();
+        // pnl = (0.80 - 0.60) * 10 = 2.0
+        assert!((pnl - 2.0).abs() < 1e-10);
+
+        // Position should now be closed
+        let positions = db.get_open_positions().unwrap();
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_get_open_positions_with_market() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        db.upsert_position("0xcond1", "tok1", "YES", 0.60, 10.0)
+            .unwrap();
+
+        let positions = db.get_open_positions_with_market().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert!(positions[0].question.is_some());
+        assert!(positions[0].question.as_ref().unwrap().contains("0xcond1"));
+    }
+
+    #[test]
+    fn test_log_position_alert() {
+        let db = Database::open_in_memory().unwrap();
+        db.log_position_alert("0xcond1", "stop_loss", "Price dropped 20%", "exit", 5)
+            .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM position_alerts WHERE alert_type = 'stop_loss'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_upsert_position_with_estimate() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        db.upsert_position_with_estimate("0xcond1", "tok1", "YES", 0.60, 10.0, Some(0.75))
+            .unwrap();
+
+        let positions = db.get_open_positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert!((positions[0].estimated_probability.unwrap() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_new_tables_exist() {
+        let db = Database::open_in_memory().unwrap();
+        let tables: Vec<String> = db
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(tables.contains(&"peak_bankroll".to_string()));
+        assert!(tables.contains(&"position_alerts".to_string()));
     }
 
     #[test]

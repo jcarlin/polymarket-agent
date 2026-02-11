@@ -71,6 +71,16 @@ async def test_order_endpoint_exists(client):
 
 
 @pytest.mark.asyncio
+async def test_order_sell_side_returns_503_in_paper_mode(client):
+    """SELL side (position exit) should work but return 503 in paper mode."""
+    response = await client.post(
+        "/order",
+        json={"token_id": "tok_yes_1", "price": 0.85, "size": 3.0, "side": "SELL"},
+    )
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
 async def test_weather_unknown_city_returns_404(client):
     response = await client.get("/weather/probabilities?city=UNKNOWN&date=2026-01-15")
     assert response.status_code == 404

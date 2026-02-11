@@ -65,6 +65,16 @@ pub struct Config {
     pub executor_request_timeout_secs: u64,
     // Weather (Phase 5)
     pub weather_spread_correction: f64,
+    // Position management & risk (Phase 6)
+    pub stop_loss_pct: f64,
+    pub take_profit_pct: f64,
+    pub min_exit_edge: f64,
+    pub drawdown_circuit_breaker_pct: f64,
+    pub drawdown_sizing_reduction: f64,
+    pub volume_spike_factor: f64,
+    pub whale_move_threshold: f64,
+    pub max_correlated_exposure_pct: f64,
+    pub position_check_enabled: bool,
     // Cycle & survival (Phase 4)
     pub cycle_frequency_high_secs: u64,
     pub cycle_frequency_low_secs: u64,
@@ -169,6 +179,42 @@ impl Config {
                 .unwrap_or_else(|_| "1.0".to_string())
                 .parse()
                 .context("Failed to parse WEATHER_SPREAD_CORRECTION")?,
+            stop_loss_pct: env::var("STOP_LOSS_PCT")
+                .unwrap_or_else(|_| "0.15".to_string())
+                .parse()
+                .context("Failed to parse STOP_LOSS_PCT")?,
+            take_profit_pct: env::var("TAKE_PROFIT_PCT")
+                .unwrap_or_else(|_| "0.90".to_string())
+                .parse()
+                .context("Failed to parse TAKE_PROFIT_PCT")?,
+            min_exit_edge: env::var("MIN_EXIT_EDGE")
+                .unwrap_or_else(|_| "0.02".to_string())
+                .parse()
+                .context("Failed to parse MIN_EXIT_EDGE")?,
+            drawdown_circuit_breaker_pct: env::var("DRAWDOWN_CIRCUIT_BREAKER_PCT")
+                .unwrap_or_else(|_| "0.30".to_string())
+                .parse()
+                .context("Failed to parse DRAWDOWN_CIRCUIT_BREAKER_PCT")?,
+            drawdown_sizing_reduction: env::var("DRAWDOWN_SIZING_REDUCTION")
+                .unwrap_or_else(|_| "0.50".to_string())
+                .parse()
+                .context("Failed to parse DRAWDOWN_SIZING_REDUCTION")?,
+            volume_spike_factor: env::var("VOLUME_SPIKE_FACTOR")
+                .unwrap_or_else(|_| "3.0".to_string())
+                .parse()
+                .context("Failed to parse VOLUME_SPIKE_FACTOR")?,
+            whale_move_threshold: env::var("WHALE_MOVE_THRESHOLD")
+                .unwrap_or_else(|_| "5000.0".to_string())
+                .parse()
+                .context("Failed to parse WHALE_MOVE_THRESHOLD")?,
+            max_correlated_exposure_pct: env::var("MAX_CORRELATED_EXPOSURE_PCT")
+                .unwrap_or_else(|_| "0.15".to_string())
+                .parse()
+                .context("Failed to parse MAX_CORRELATED_EXPOSURE_PCT")?,
+            position_check_enabled: env::var("POSITION_CHECK_ENABLED")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .context("Failed to parse POSITION_CHECK_ENABLED")?,
             cycle_frequency_high_secs: env::var("CYCLE_FREQUENCY_HIGH_SECS")
                 .unwrap_or_else(|_| "600".to_string())
                 .parse()

@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn test_position_capped_by_max_pct() {
         let sizer = PositionSizer::new(1.0, 0.06, 1.0); // full Kelly, 6% cap
-        // Large kelly → capped at 6% of bankroll
+                                                        // Large kelly → capped at 6% of bankroll
         let opp = make_opportunity(TradeSide::Yes, 0.95, 0.50, 0.45);
         // kelly = (0.95 - 0.50) / (1 - 0.50) = 0.90
         // position = min(0.90*100, 0.06*100, 100) = min(90, 6, 100) = 6

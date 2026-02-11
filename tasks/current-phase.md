@@ -1,26 +1,34 @@
-# Phase 5: Weather Pipeline (Highest Edge)
+# Phase 6: Position Management & Risk
 
 ## Status: COMPLETE
 
 ### Checklist
 
-- [x] `sidecar/weather/__init__.py` — Empty module init
-- [x] `sidecar/weather/open_meteo.py` — Open-Meteo Ensemble API client (20 cities, GEFS+ECMWF, UTC-to-local, retry logic)
-- [x] `sidecar/weather/probability_model.py` — Gaussian KDE → 2°F bucket probabilities (scipy, histogram fallback)
-- [x] `sidecar/weather/test_open_meteo.py` — 8 tests (city configs, temp conversion, daily max extraction, unknown city)
-- [x] `sidecar/weather/test_probability_model.py` — 10 tests (KDE sum≈1, degenerate cases, spread correction, bimodal)
-- [x] `sidecar/server.py` — GET /weather/probabilities endpoint (404/400/502 error handling)
-- [x] `sidecar/test_server.py` — 4 new tests (unknown city, invalid date, missing params, endpoint exists)
-- [x] `src/weather_client.rs` — WeatherClient, parse_weather_market, get_weather_model_probability + 11 tests
-- [x] `src/config.rs` — weather_spread_correction field added
-- [x] `src/market_scanner.rs` — test_config() updated
-- [x] `src/lib.rs` — weather_client module registered
-- [x] `Cargo.toml` — regex dependency added
-- [x] `src/estimator.rs` — WeatherContext struct, weather param on evaluate/analyze/render_prompt, weather block rendering
-- [x] `src/main.rs` — WeatherClient init, weather cache per city/date, weather context construction in analysis loop
-- [x] `tests/integration.rs` — 3 new tests (parsing+bucket lookup, client deserialization, non-weather returns none)
-- [x] `.env.example` — WEATHER_SPREAD_CORRECTION added
-- [x] `cargo build` — passes, zero errors
-- [x] `cargo test` — 107 tests pass (96 unit + 11 integration)
-- [x] `cargo clippy -- -W clippy::all` — zero warnings
-- [x] `cd sidecar && python -m pytest -v` — 29 tests pass
+- [x] `CLAUDE.md` — Updated "Current Phase" to Phase 6
+- [x] `src/config.rs` — +9 config fields (stop_loss, take_profit, drawdown, etc.)
+- [x] `.env.example` — +9 env vars for position management
+- [x] `src/market_scanner.rs` — test_config() updated with new fields
+- [x] `src/db.rs` — 2 new tables (peak_bankroll, position_alerts), PositionRow extension, 6+ new methods
+- [x] `src/position_manager.rs` — NEW: core position management module + tests
+- [x] `src/lib.rs` — +2 module declarations (position_manager, data_sources)
+- [x] `src/executor.rs` — +exit_position/exit_paper/exit_live + tests
+- [x] `sidecar/server.py` — order_type field on OrderRequest
+- [x] `src/data_sources/mod.rs` — NEW: module declaration
+- [x] `src/data_sources/openclaw.rs` — NEW: stub interface
+- [x] `src/main.rs` — Wire position management into cycle loop
+- [x] `tests/integration.rs` — +4 integration tests
+- [x] `cargo build` — passes
+- [x] `cargo test` — 149 tests pass (134 unit + 15 integration)
+- [x] `cargo clippy` — 0 warnings
+- [x] `cd sidecar && python -m pytest -v` — 30 tests pass
+- [x] `tasks/lessons.md` — Phase 6 learnings added
+
+### Summary
+
+Added the defensive layer that prevents unmanaged losing positions:
+- **Stop-loss** (15% threshold), **take-profit** (90% captured value), **edge decay** (2% min edge)
+- **Drawdown circuit breaker**: reduces Kelly fraction 50% when bankroll drops >30% from peak
+- **Correlation groups**: 5 geographic regions, 15% max exposure per group
+- **Position exits**: paper + live mode via existing sidecar `/order` endpoint
+- **OpenClaw stub**: interface established for Phase 7+ news integration
+- **DB schema**: peak_bankroll tracking, position_alerts audit log, estimated_probability on positions

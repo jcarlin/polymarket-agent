@@ -258,6 +258,15 @@ mod tests {
             low_bankroll_threshold: 200.0,
             death_exit_code: 42,
             weather_spread_correction: 1.0,
+            stop_loss_pct: 0.15,
+            take_profit_pct: 0.90,
+            min_exit_edge: 0.02,
+            drawdown_circuit_breaker_pct: 0.30,
+            drawdown_sizing_reduction: 0.50,
+            volume_spike_factor: 3.0,
+            whale_move_threshold: 5000.0,
+            max_correlated_exposure_pct: 0.15,
+            position_check_enabled: true,
         }
     }
 

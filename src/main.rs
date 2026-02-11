@@ -11,6 +11,7 @@ use polymarket_agent::edge_detector::{EdgeDetector, TradeSide};
 use polymarket_agent::estimator::{Estimator, WeatherContext};
 use polymarket_agent::executor::{Executor, TradeIntent};
 use polymarket_agent::market_scanner::{GammaMarket, MarketScanner};
+use polymarket_agent::position_manager::PositionManager;
 use polymarket_agent::position_sizer::PositionSizer;
 use polymarket_agent::sidecar::SidecarProcess;
 use polymarket_agent::weather_client::{
@@ -72,7 +73,7 @@ async fn main() -> Result<()> {
     let scanner = MarketScanner::new(&config)?;
     let clob = ClobClient::new(&config.clob_api_url, config.scanner_request_timeout_secs)?;
     let edge_detector = EdgeDetector::new(config.min_edge_threshold);
-    let position_sizer = PositionSizer::new(
+    let _position_sizer = PositionSizer::new(
         config.kelly_fraction,
         config.max_position_pct,
         config.max_total_exposure_pct,
@@ -82,6 +83,16 @@ async fn main() -> Result<()> {
         config.trading_mode.clone(),
         config.executor_request_timeout_secs,
     )?;
+
+    // Initialize position manager (Phase 6)
+    let position_manager = PositionManager::new(
+        config.stop_loss_pct,
+        config.take_profit_pct,
+        config.min_exit_edge,
+        config.volume_spike_factor,
+        config.whale_move_threshold,
+        config.max_correlated_exposure_pct,
+    );
 
     // Initialize weather client (uses sidecar endpoint)
     let weather_client = match WeatherClient::new(
@@ -267,6 +278,43 @@ async fn main() -> Result<()> {
         let mut current_exposure = db.get_total_exposure()?;
         let mut trades_placed = 0u32;
 
+        // Check drawdown state for sizing adjustment
+        let drawdown_state = match PositionManager::check_drawdown(
+            &db,
+            bankroll,
+            config.drawdown_circuit_breaker_pct,
+        ) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                warn!("Drawdown check failed: {}", e);
+                None
+            }
+        };
+
+        // Adjust kelly fraction during drawdown
+        let effective_kelly = if drawdown_state
+            .as_ref()
+            .is_some_and(|s| s.is_circuit_breaker_active)
+        {
+            let reduced = config.kelly_fraction * config.drawdown_sizing_reduction;
+            info!(
+                "Drawdown active — reducing Kelly from {:.2} to {:.2}",
+                config.kelly_fraction, reduced,
+            );
+            reduced
+        } else {
+            config.kelly_fraction
+        };
+
+        let effective_sizer = PositionSizer::new(
+            effective_kelly,
+            config.max_position_pct,
+            config.max_total_exposure_pct,
+        );
+
+        // Get current open positions for correlation checks
+        let open_positions = db.get_open_positions_with_market().unwrap_or_default();
+
         for opp in &opportunities {
             let token_id = match find_token_id(&markets, &opp.market_id, &opp.side) {
                 Some(id) => id,
@@ -279,7 +327,20 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let sizing = position_sizer.size_position(opp, bankroll, current_exposure);
+            // Check correlation limit before sizing
+            if position_manager.is_correlated_group_over_limit(
+                &opp.question,
+                &open_positions,
+                bankroll,
+            ) {
+                info!(
+                    "Skipping {} — correlated weather group over exposure limit",
+                    opp.question,
+                );
+                continue;
+            }
+
+            let sizing = effective_sizer.size_position(opp, bankroll, current_exposure);
             if sizing.is_rejected() {
                 info!(
                     "Skipping {}: {}",
@@ -291,12 +352,24 @@ async fn main() -> Result<()> {
 
             let intent = TradeIntent {
                 opportunity: opp.clone(),
-                token_id,
+                token_id: token_id.clone(),
                 sizing: sizing.clone(),
             };
 
             match executor.execute(&intent, &db).await {
                 Ok(result) => {
+                    // Store estimated_probability with the position
+                    if let Err(e) = db.upsert_position_with_estimate(
+                        &result.market_condition_id,
+                        &result.token_id,
+                        &result.side.to_string(),
+                        result.price,
+                        result.size,
+                        Some(opp.estimated_probability),
+                    ) {
+                        warn!("Failed to update position with estimate: {}", e);
+                    }
+
                     trades_placed += 1;
                     bankroll = db.get_current_bankroll()?;
                     current_exposure = db.get_total_exposure()?;
@@ -312,6 +385,62 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     warn!("Trade execution failed for '{}': {}", opp.question, e);
+                }
+            }
+        }
+
+        // Step 5.5: Position management — check stop-loss, take-profit, edge decay
+        if config.position_check_enabled {
+            match position_manager
+                .check_positions(&db, &clob, cycle_number)
+                .await
+            {
+                Ok(mgmt_result) => {
+                    for (pos, reason) in &mgmt_result.exits_triggered {
+                        let exit_price = pos.current_price.unwrap_or(pos.entry_price);
+                        match executor.exit_position(&db, pos, exit_price).await {
+                            Ok(pnl) => {
+                                info!(
+                                    "Position exit: {} {} pnl=${:.2} ({})",
+                                    pos.side, pos.market_condition_id, pnl, reason,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to exit {} {}: {}",
+                                    pos.side, pos.market_condition_id, e,
+                                );
+                            }
+                        }
+                    }
+
+                    // Log correlation alerts
+                    let corr_alerts = position_manager.check_correlated_exposure(
+                        &db.get_open_positions_with_market().unwrap_or_default(),
+                        db.get_current_bankroll()?,
+                    );
+                    for alert in &corr_alerts {
+                        warn!("CORRELATION ALERT: {}", alert.details);
+                        let _ = db.log_position_alert(
+                            &alert.market_condition_id,
+                            &alert.alert_type,
+                            &alert.details,
+                            &alert.action_taken,
+                            cycle_number,
+                        );
+                    }
+
+                    if mgmt_result.positions_checked > 0 {
+                        info!(
+                            "Position management: {} checked, {} exits, {} re-analyze",
+                            mgmt_result.positions_checked,
+                            mgmt_result.exits_triggered.len(),
+                            mgmt_result.re_analyses_triggered,
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Position management check failed: {}", e);
                 }
             }
         }

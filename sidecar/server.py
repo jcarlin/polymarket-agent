@@ -32,6 +32,7 @@ class OrderRequest(BaseModel):
     price: float
     size: float
     side: str
+    order_type: str = "GTC"
 
 
 class OrderResponse(BaseModel):

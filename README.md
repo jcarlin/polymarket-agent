@@ -50,17 +50,57 @@ claude
 
 See `CLAUDE.md` for the full specification and build phases.
 
+## Build Progress
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1 | Skeleton, Market Scanner & Sidecar | Done |
+| 2 | Claude Analysis Engine & Edge Detection | Done |
+| 3 | Position Sizing & Execution | Done |
+| 4 | Accounting & Survival | Done |
+| 5 | Weather Pipeline (Highest Edge) | Done |
+| 6 | Position Management & Risk | Done |
+| 7 | Web Dashboard | Next |
+
+## What Works Today
+
+- **Market scanning**: Paginated Gamma API discovery with liquidity/category filters
+- **Claude analysis**: Haiku triage → Sonnet deep analysis pipeline with structured JSON output
+- **Edge detection**: Fair value vs market price comparison, configurable thresholds
+- **Position sizing**: Half-Kelly criterion with 6% bankroll cap and exposure limits
+- **Trade execution**: Paper mode (simulated) and live mode (via sidecar → py-clob-client)
+- **Weather pipeline**: 82 ensemble members (GEFS+ECMWF) → KDE probability buckets for 20 US cities
+- **Position management**: Stop-loss (15%), take-profit (90%), edge decay, drawdown circuit breaker
+- **Risk controls**: Correlation groups for weather markets, max exposure limits, adaptive cycle timing
+- **Survival mechanic**: Real-time bankroll ledger, API cost tracking, graceful death on $0
+
 ## Project Structure
 
 ```
 ├── CLAUDE.md                 # Full spec (Claude Code reads this automatically)
 ├── docs/
 │   ├── weather-research.md   # Weather data feasibility research
-│   └── api-reference.md      # Polymarket API endpoints + examples
+│   ├── api-reference.md      # Polymarket API endpoints + examples
+│   └── claude-code-workflow.md
 ├── src/                      # Rust core
+│   ├── main.rs               # Entry point, scheduler, lifecycle
+│   ├── config.rs             # All configurable params from .env
+│   ├── market_scanner.rs     # Gamma API client (market discovery)
+│   ├── estimator.rs          # Claude API integration (analysis brain)
+│   ├── edge_detector.rs      # Fair value vs market price comparison
+│   ├── position_sizer.rs     # Kelly Criterion with bankroll cap
+│   ├── executor.rs           # Order execution + position exits
+│   ├── position_manager.rs   # Stop-loss, take-profit, drawdown
+│   ├── accounting.rs         # Bankroll, API costs, survival check
+│   ├── weather_client.rs     # Sidecar weather endpoint client
+│   ├── clob_client.rs        # CLOB API orderbook/prices
+│   └── data_sources/         # OpenClaw stub + future integrations
 ├── sidecar/                  # Python FastAPI sidecar
+│   ├── server.py             # FastAPI app on localhost:9090
+│   ├── polymarket_client.py  # py-clob-client wrapper
+│   └── weather/              # Open-Meteo ensemble → probabilities
 ├── prompts/                  # Claude prompt templates
-├── static/                   # Dashboard HTML
+├── tasks/                    # Lessons learned + phase tracking
 └── .claude/                  # Claude Code agents + commands
 ```
 
