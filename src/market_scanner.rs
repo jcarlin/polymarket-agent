@@ -253,6 +253,10 @@ mod tests {
             max_total_exposure_pct: 0.40,
             initial_bankroll: 50.0,
             executor_request_timeout_secs: 15,
+            cycle_frequency_high_secs: 600,
+            cycle_frequency_low_secs: 1800,
+            low_bankroll_threshold: 200.0,
+            death_exit_code: 42,
         }
     }
 

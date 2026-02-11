@@ -1,3 +1,4 @@
+use polymarket_agent::accounting::Accountant;
 use polymarket_agent::config::Config;
 use polymarket_agent::db::Database;
 
@@ -132,4 +133,75 @@ async fn test_paper_trade_end_to_end() {
     // Verify position created
     let positions = db.get_open_positions().unwrap();
     assert_eq!(positions.len(), 1);
+}
+
+#[test]
+fn test_accounting_api_cost_deduction() {
+    let db = Database::open_in_memory().unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+
+    // Log some API costs for cycle 1
+    db.log_api_cost(1, None, "haiku", 500, 50, 0.05, "triage")
+        .unwrap();
+    db.log_api_cost(1, None, "sonnet", 2000, 200, 0.15, "analysis")
+        .unwrap();
+
+    let accountant = Accountant::new(200.0);
+    let result = accountant.close_cycle(&db, 1).unwrap();
+
+    assert!((result.bankroll_before - 50.0).abs() < f64::EPSILON);
+    assert!((result.api_cost - 0.20).abs() < 1e-10);
+    assert!((result.bankroll_after - 49.80).abs() < 1e-10);
+    assert!(result.is_alive);
+
+    // Verify bankroll was actually updated in DB
+    let bankroll = db.get_current_bankroll().unwrap();
+    assert!((bankroll - 49.80).abs() < 1e-10);
+}
+
+#[test]
+fn test_accounting_death_condition() {
+    let db = Database::open_in_memory().unwrap();
+    db.ensure_bankroll_seeded(0.01).unwrap();
+
+    // Log API cost exceeding bankroll
+    db.log_api_cost(1, None, "sonnet", 2000, 200, 0.50, "analysis")
+        .unwrap();
+
+    let accountant = Accountant::new(200.0);
+    let result = accountant.close_cycle(&db, 1).unwrap();
+
+    assert!(!result.is_alive);
+    assert!(result.bankroll_after < 0.0);
+}
+
+#[test]
+fn test_cycle_number_persistence() {
+    let db = Database::open_in_memory().unwrap();
+
+    // Empty DB starts at cycle 1
+    assert_eq!(db.get_next_cycle_number().unwrap(), 1);
+
+    // Insert some cycle entries
+    db.conn
+        .execute(
+            "INSERT INTO cycle_log (cycle_number, markets_scanned, trades_placed, api_cost_usd) VALUES (1, 10, 0, 0.01)",
+            [],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO cycle_log (cycle_number, markets_scanned, trades_placed, api_cost_usd) VALUES (2, 15, 1, 0.02)",
+            [],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO cycle_log (cycle_number, markets_scanned, trades_placed, api_cost_usd) VALUES (3, 12, 0, 0.03)",
+            [],
+        )
+        .unwrap();
+
+    // Should resume at cycle 4
+    assert_eq!(db.get_next_cycle_number().unwrap(), 4);
 }

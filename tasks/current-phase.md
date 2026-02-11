@@ -1,21 +1,17 @@
-# Phase 3: Position Sizing & Execution
+# Phase 4: Accounting & Survival
 
 ## Status: COMPLETE
 
 ### Checklist
 
-- [x] `src/config.rs` — 5 new fields (kelly_fraction, max_position_pct, max_total_exposure_pct, initial_bankroll, executor_request_timeout_secs)
-- [x] `.env.example` — Phase 3 vars uncommented
-- [x] `src/db.rs` — PositionRow struct + 7 new methods (insert_trade, upsert_position, log_bankroll_entry, get_current_bankroll, get_total_exposure, get_open_positions, ensure_bankroll_seeded) + 9 tests
-- [x] `src/position_sizer.rs` — Kelly Criterion with half-Kelly, position cap, exposure limit (10 tests)
-- [x] `src/executor.rs` — Paper + live mode execution, DB logging (8 tests)
-- [x] `src/lib.rs` — position_sizer + executor modules registered
-- [x] `src/main.rs` — Full Phase 3 pipeline: sizing → execution → bankroll update
-- [x] `sidecar/polymarket_client.py` — place_order method via py-clob-client
-- [x] `sidecar/server.py` — POST /order endpoint (503 if not initialized)
-- [x] `sidecar/test_server.py` — 3 new tests (503, validation, endpoint exists)
-- [x] `tests/integration.rs` — 2 new tests (kelly basic, paper trade e2e)
+- [x] `src/config.rs` — 4 new fields (cycle_frequency_high_secs, cycle_frequency_low_secs, low_bankroll_threshold, death_exit_code)
+- [x] `.env.example` — Phase 4 vars added
+- [x] `src/market_scanner.rs` — test_config() updated with new fields
+- [x] `src/db.rs` — TradeRow struct + 3 new methods (get_next_cycle_number, get_total_trades_count, get_recent_trades) + 4 tests
+- [x] `src/accounting.rs` — Accountant, CycleAccounting, DeathReport structs + close_cycle, get_cycle_duration_secs, generate_death_report methods + 9 tests
+- [x] `src/lib.rs` — accounting module registered
+- [x] `src/main.rs` — Recurring loop with: cycle numbering from DB, API cost deduction, survival check, death report + exit(42), adaptive sleep, Ctrl+C graceful shutdown
+- [x] `tests/integration.rs` — 3 new tests (api_cost_deduction, death_condition, cycle_number_persistence)
 - [x] `cargo build` — passes, zero warnings
-- [x] `cargo test` — all 77 tests pass (72 unit + 5 integration)
+- [x] `cargo test` — all 93 tests pass (85 unit + 8 integration)
 - [x] `cargo clippy -- -W clippy::all` — zero warnings
-- [x] `cd sidecar && python -m pytest` — all 7 tests pass

@@ -1,3 +1,4 @@
+pub mod accounting;
 pub mod clob_client;
 pub mod config;
 pub mod db;

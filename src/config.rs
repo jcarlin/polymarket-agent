@@ -63,6 +63,11 @@ pub struct Config {
     pub max_total_exposure_pct: f64,
     pub initial_bankroll: f64,
     pub executor_request_timeout_secs: u64,
+    // Cycle & survival (Phase 4)
+    pub cycle_frequency_high_secs: u64,
+    pub cycle_frequency_low_secs: u64,
+    pub low_bankroll_threshold: f64,
+    pub death_exit_code: i32,
 }
 
 impl Config {
@@ -158,6 +163,22 @@ impl Config {
                 .unwrap_or_else(|_| "15".to_string())
                 .parse()
                 .context("Failed to parse EXECUTOR_REQUEST_TIMEOUT_SECS")?,
+            cycle_frequency_high_secs: env::var("CYCLE_FREQUENCY_HIGH_SECS")
+                .unwrap_or_else(|_| "600".to_string())
+                .parse()
+                .context("Failed to parse CYCLE_FREQUENCY_HIGH_SECS")?,
+            cycle_frequency_low_secs: env::var("CYCLE_FREQUENCY_LOW_SECS")
+                .unwrap_or_else(|_| "1800".to_string())
+                .parse()
+                .context("Failed to parse CYCLE_FREQUENCY_LOW_SECS")?,
+            low_bankroll_threshold: env::var("LOW_BANKROLL_THRESHOLD")
+                .unwrap_or_else(|_| "200.0".to_string())
+                .parse()
+                .context("Failed to parse LOW_BANKROLL_THRESHOLD")?,
+            death_exit_code: env::var("DEATH_EXIT_CODE")
+                .unwrap_or_else(|_| "42".to_string())
+                .parse()
+                .context("Failed to parse DEATH_EXIT_CODE")?,
         })
     }
 
@@ -188,6 +209,10 @@ mod tests {
         assert_eq!(config.min_edge_threshold, 0.08);
         assert_eq!(config.estimator_request_timeout_secs, 30);
         assert_eq!(config.estimator_max_retries, 2);
+        assert_eq!(config.cycle_frequency_high_secs, 600);
+        assert_eq!(config.cycle_frequency_low_secs, 1800);
+        assert_eq!(config.low_bankroll_threshold, 200.0);
+        assert_eq!(config.death_exit_code, 42);
     }
 
     #[test]

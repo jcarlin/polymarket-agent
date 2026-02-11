@@ -3,6 +3,18 @@ use rusqlite::Connection;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
+pub struct TradeRow {
+    pub trade_id: String,
+    pub market_condition_id: String,
+    pub side: String,
+    pub price: f64,
+    pub size: f64,
+    pub status: String,
+    pub paper: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PositionRow {
     pub market_condition_id: String,
     pub token_id: String,
@@ -205,6 +217,54 @@ impl Database {
             positions.push(row.context("Failed to read position row")?);
         }
         Ok(positions)
+    }
+
+    pub fn get_next_cycle_number(&self) -> Result<i64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(cycle_number), 0) + 1 FROM cycle_log",
+                [],
+                |row| row.get(0),
+            )
+            .context("Failed to get next cycle number")?;
+        Ok(n)
+    }
+
+    pub fn get_total_trades_count(&self) -> Result<i64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM trades", [], |row| row.get(0))
+            .context("Failed to get total trades count")?;
+        Ok(count)
+    }
+
+    pub fn get_recent_trades(&self, limit: i64) -> Result<Vec<TradeRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT trade_id, market_condition_id, side, price, size, status, paper, created_at FROM trades ORDER BY id DESC LIMIT ?1",
+            )
+            .context("Failed to prepare recent trades query")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(TradeRow {
+                    trade_id: row.get(0)?,
+                    market_condition_id: row.get(1)?,
+                    side: row.get(2)?,
+                    price: row.get(3)?,
+                    size: row.get(4)?,
+                    status: row.get(5)?,
+                    paper: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .context("Failed to query recent trades")?;
+        let mut trades = Vec::new();
+        for row in rows {
+            trades.push(row.context("Failed to read trade row")?);
+        }
+        Ok(trades)
     }
 
     pub fn ensure_bankroll_seeded(&self, initial: f64) -> Result<()> {
@@ -550,6 +610,58 @@ mod tests {
             .unwrap();
         let positions = db.get_open_positions().unwrap();
         assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn test_get_next_cycle_number_empty() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.get_next_cycle_number().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_next_cycle_number_populated() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO cycle_log (cycle_number, markets_scanned, trades_placed, api_cost_usd) VALUES (1, 10, 0, 0.01)",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO cycle_log (cycle_number, markets_scanned, trades_placed, api_cost_usd) VALUES (2, 15, 1, 0.02)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_next_cycle_number().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_get_recent_trades() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true)
+            .unwrap();
+        db.insert_trade("t2", "0xcond1", "tok1", "NO", 0.40, 3.0, "filled", true)
+            .unwrap();
+        db.insert_trade("t3", "0xcond1", "tok1", "YES", 0.70, 2.0, "filled", true)
+            .unwrap();
+
+        let trades = db.get_recent_trades(2).unwrap();
+        assert_eq!(trades.len(), 2);
+        // Most recent first
+        assert_eq!(trades[0].trade_id, "t3");
+        assert_eq!(trades[1].trade_id, "t2");
+    }
+
+    #[test]
+    fn test_get_total_trades_count() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.get_total_trades_count().unwrap(), 0);
+        insert_test_market(&db, "0xcond1");
+        db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true)
+            .unwrap();
+        assert_eq!(db.get_total_trades_count().unwrap(), 1);
     }
 
     #[test]

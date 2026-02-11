@@ -29,3 +29,10 @@ Read this at the start of every session.
 - **SQLite foreign key enforcement is ON:** The `trades` and `positions` tables have FK constraints referencing `markets(condition_id)`. Test code must insert a market row first before inserting trades/positions, or the INSERT will fail with "FOREIGN KEY constraint failed".
 - **Kelly formula for binary markets:** `(win_prob - buy_price) / (1 - buy_price)` where `buy_price = market_price` for YES, `1 - market_price` for NO. Simple and correct — no need for the more complex multi-outcome Kelly.
 - **Paper mode needs no sidecar:** Paper execution generates a UUID, logs to DB, updates bankroll — all in-process. Live mode just adds one HTTP POST to sidecar before the same DB writes. This separation keeps testing fast and isolated.
+
+## Phase 4
+
+- **Config struct literals in tests:** When adding fields to `Config`, the `test_config()` helper in `market_scanner.rs` must be updated too — it constructs `Config` directly (not via `from_env()`). Grep for `Config {` to find all literal constructors.
+- **Accountant is stateless by design:** Reads all state from DB each cycle. This means the agent can crash and restart cleanly — cycle number is seeded from `MAX(cycle_number)` in `cycle_log`.
+- **Zero API cost skip:** When a cycle has no API calls, `close_cycle()` skips writing a bankroll_log entry entirely. This avoids noise in the ledger and prevents divide-by-zero edge cases.
+- **`tokio::select!` for Ctrl+C:** Always use `tokio::select!` between sleep and `ctrl_c()` — even with zero-duration sleep. Avoids needing the `futures` crate for `now_or_never()`.
