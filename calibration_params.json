@@ -1,0 +1,122 @@
+{
+  "NYC": {
+    "city": "NYC",
+    "bias_offset": 0.61,
+    "spread_factor": 0.9435,
+    "sample_size": 10
+  },
+  "LAX": {
+    "city": "LAX",
+    "bias_offset": -0.32,
+    "spread_factor": 0.9773,
+    "sample_size": 10
+  },
+  "CHI": {
+    "city": "CHI",
+    "bias_offset": -1.16,
+    "spread_factor": 1.0046,
+    "sample_size": 10
+  },
+  "HOU": {
+    "city": "HOU",
+    "bias_offset": -0.16,
+    "spread_factor": 1.008,
+    "sample_size": 10
+  },
+  "PHX": {
+    "city": "PHX",
+    "bias_offset": -0.05,
+    "spread_factor": 1.2203,
+    "sample_size": 10
+  },
+  "PHL": {
+    "city": "PHL",
+    "bias_offset": 1.37,
+    "spread_factor": 0.9607,
+    "sample_size": 10
+  },
+  "SAN": {
+    "city": "SAN",
+    "bias_offset": -0.05,
+    "spread_factor": 0.9603,
+    "sample_size": 10
+  },
+  "SDG": {
+    "city": "SDG",
+    "bias_offset": -0.93,
+    "spread_factor": 0.9548,
+    "sample_size": 10
+  },
+  "DAL": {
+    "city": "DAL",
+    "bias_offset": 0.59,
+    "spread_factor": 0.9832,
+    "sample_size": 10
+  },
+  "SJC": {
+    "city": "SJC",
+    "bias_offset": -0.51,
+    "spread_factor": 0.9255,
+    "sample_size": 10
+  },
+  "ATL": {
+    "city": "ATL",
+    "bias_offset": 1.02,
+    "spread_factor": 0.949,
+    "sample_size": 10
+  },
+  "MIA": {
+    "city": "MIA",
+    "bias_offset": 0.08,
+    "spread_factor": 0.9721,
+    "sample_size": 10
+  },
+  "BOS": {
+    "city": "BOS",
+    "bias_offset": 0.82,
+    "spread_factor": 0.9909,
+    "sample_size": 10
+  },
+  "SEA": {
+    "city": "SEA",
+    "bias_offset": 1.29,
+    "spread_factor": 1.0808,
+    "sample_size": 10
+  },
+  "DEN": {
+    "city": "DEN",
+    "bias_offset": 0.07,
+    "spread_factor": 1.0555,
+    "sample_size": 10
+  },
+  "DCA": {
+    "city": "DCA",
+    "bias_offset": 0.63,
+    "spread_factor": 0.9036,
+    "sample_size": 10
+  },
+  "MSP": {
+    "city": "MSP",
+    "bias_offset": -0.43,
+    "spread_factor": 1.0054,
+    "sample_size": 10
+  },
+  "DTW": {
+    "city": "DTW",
+    "bias_offset": -0.45,
+    "spread_factor": 1.0095,
+    "sample_size": 10
+  },
+  "TPA": {
+    "city": "TPA",
+    "bias_offset": -0.89,
+    "spread_factor": 0.9329,
+    "sample_size": 10
+  },
+  "STL": {
+    "city": "STL",
+    "bias_offset": -0.49,
+    "spread_factor": 1.0184,
+    "sample_size": 10
+  }
+}

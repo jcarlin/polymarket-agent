@@ -45,6 +45,12 @@ Read this at the start of every session.
 - **HashMap entry API for clippy.** Using `contains_key()` + `insert()` triggers clippy's `map_entry` lint. Use `Entry::Vacant(entry)` pattern instead.
 - **`parse_weather_market` is best-effort regex.** If it can't parse the question, returns None and the market goes through normal non-weather analysis. No trades are missed.
 - **Parallel Python + Rust agent streams work well.** Phase 5 used 3 streams: Python sidecar (weather module + endpoint), Rust (weather_client + config), Integration (estimator + main.rs). Python and Rust ran in parallel, integration after both completed.
+- **WU is an Angular SPA — HTML scraping returns empty shell.** Use Weather.com JSON API instead: `api.weather.com/v1/location/{ICAO}:9:US/observations/historical.json` for actuals, `/v3/wx/forecast/daily/5day` for forecast. Daily high = max(temp) from hourly observations.
+- **NWS weight of 0.85 dominates the blend.** Ensemble spread still matters for uncertainty estimation, but the NWS anchor prevents the systematic cold bias of raw GEFS/ECMWF ensembles.
+- **Four-layer correction order matters:** NWS → calibration → HRRR → WU forecast. Each shift is relative to the current (already-shifted) mean, so reordering changes the result.
+- **Calibration needs min 5 observations per city before it activates.** Below that threshold, `WEATHER_DEFAULT_BIAS_OFFSET=4.0` bridges the NWS→WU gap.
+- **HRRR only helps for same-day markets.** Longer-range markets should skip it (`same_day=false`). HRRR has an 18-48hr forecast horizon.
+- **WU forecast API runs ~4°F cold vs WU website.** The `WEATHER_WU_FORECAST_WEIGHT=0.25` is set conservatively because of this discrepancy.
 
 ## Phase 6
 

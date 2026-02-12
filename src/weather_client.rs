@@ -280,6 +280,46 @@ impl WeatherClient {
         Ok(result.collected)
     }
 
+    /// Trigger backfill of historical weather data for calibration bootstrap.
+    /// Calls POST /weather/backfill on the sidecar.
+    pub async fn backfill(&self, days_back: u32) -> Result<u32> {
+        let url = format!("{}/weather/backfill", self.base_url);
+        let body = serde_json::json!({
+            "days_back": days_back,
+            "force": false,
+        });
+
+        // Backfill processes 20 cities × multiple days with rate limiting,
+        // so it needs a much longer timeout than normal API calls.
+        let backfill_client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("Failed to build backfill HTTP client")?;
+
+        let resp = backfill_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to call backfill")?;
+
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("backfill returned {}: {}", code, body);
+        }
+
+        #[derive(Deserialize)]
+        struct BackfillResponse {
+            rows_inserted: u32,
+        }
+        let result: BackfillResponse = resp
+            .json()
+            .await
+            .context("Failed to parse backfill response")?;
+        Ok(result.rows_inserted)
+    }
+
     /// Trigger calibration recomputation on the sidecar
     pub async fn trigger_calibration(&self) -> Result<u32> {
         let url = format!("{}/weather/calibrate", self.base_url);
@@ -762,6 +802,25 @@ mod tests {
 
         let prob = get_weather_model_probability(&info, &probs).unwrap();
         assert!((prob - 0.35).abs() < 0.01);
+    }
+
+    #[tokio::test]
+    async fn test_backfill() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/weather/backfill"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "cities_processed": 20,
+                "rows_inserted": 150,
+                "errors": 2,
+            })))
+            .mount(&server)
+            .await;
+
+        let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
+        let rows = client.backfill(10).await.unwrap();
+        assert_eq!(rows, 150);
     }
 
     #[test]

@@ -3,9 +3,10 @@
 ## Summary
 
 All major ensemble forecast systems are completely free for individual developers.
-The fastest path uses **Open-Meteo's Ensemble API** which serves GEFS (31 members) and
-ECMWF IFS (51 members) as simple JSON — no GRIB2 parsing required. This gives us 82
-ensemble members for probability estimation per city at zero data cost.
+The current implementation uses **Open-Meteo's Ensemble API** for GEFS (31) + ECMWF (51) +
+ICON (40) + GEM (21) = **143 ensemble members** as simple JSON, plus NWS point forecasts,
+HRRR for same-day markets, WU actuals/forecasts, and an automated calibration pipeline.
+No GRIB2 parsing required for the core pipeline (NBM via Herbie is optional).
 
 ---
 
@@ -72,7 +73,7 @@ GET https://ensemble-api.open-meteo.com/v1/ensemble
 Returns hourly temperature for every member:
 - `temperature_2m_member00` through `temperature_2m_member30` (GEFS, 31 members)
 - `temperature_2m_member00` through `temperature_2m_member50` (ECMWF, 51 members)
-- Combined: **82 ensemble members** per city
+- Combined: **82 ensemble members** per city (GEFS+ECMWF only; add ICON+GEM for 143 total)
 
 ### Rate Limits
 - Free tier: **10,000 API calls/day**, 600/minute
@@ -106,7 +107,7 @@ Options:
 
 ### Converting Ensemble Members to Bucket Probabilities
 
-For each city and forecast date, we have 82 temperature values (31 GEFS + 51 ECMWF).
+For each city and forecast date, we have 143 temperature values (31 GEFS + 51 ECMWF + 40 ICON + 21 GEM).
 
 **Method: Gaussian Kernel Density Estimation (KDE)**
 ```python
@@ -188,24 +189,29 @@ airport METAR stations. The station determines the "ground truth."
 
 ## Implementation Tiers
 
-### Tier 1 — Weekend Prototype (for this project's Phase 5)
-- Open-Meteo Ensemble API for GEFS + ECMWF
-- Gaussian KDE over 82 combined ensemble members
-- Python sidecar endpoint: `GET /weather/probabilities?city=NYC&date=2026-02-11`
-- Dependencies: `requests`, `numpy`, `scipy`
+### Tier 1 — MVP (Implemented in Phase 5)
+- Open-Meteo Ensemble API for GEFS + ECMWF + ICON + GEM (143 members)
+- Gaussian KDE over all ensemble members with NWS-anchored four-layer bias correction
+- NWS point forecast as primary anchor (weight 0.85)
+- HRRR same-day forecasts via Open-Meteo (hourly 3km)
+- WU scraper: Weather.com JSON API for actuals + 5-day forecast anchoring
+- Automated calibration pipeline: WU actuals → per-city bias/spread → applied on next cycle
+- NBM percentile blending (optional, via Herbie)
+- Sidecar endpoints: `/weather/probabilities`, `/weather/wu_actual`, `/weather/validate`,
+  `/weather/hrrr`, `/weather/nbm`, `/weather/calibrate`, `/weather/collect_actual`,
+  `/weather/collect_actuals_batch`
+- Dependencies: `httpx`, `numpy`, `scipy`
 - Cost: $0 (or $99/month for commercial Open-Meteo license)
 
-### Tier 2 — Production Upgrade (after proving profitability)
-- Direct GEFS/ECMWF download from AWS S3 via Herbie library
-- Add NBM data for calibrated baseline probabilities
+### Tier 2 — Production Upgrade (future)
+- Direct GEFS/ECMWF download from AWS S3 via Herbie library (eliminates Open-Meteo dependency)
 - Historical bias correction using ERA5 reanalysis
 - Self-hosted Open-Meteo via Docker for unlimited access
 - Dependencies add: `herbie-data`, `cfgrib`, `xarray`, `ecmwf-opendata`
 
-### Tier 3 — Maximum Edge
-- Multi-model Bayesian ensemble weighting (all 6+ models)
-- GEFS underdispersion correction via historical verification
-- Automated calibration pipeline comparing predictions to actual resolutions
+### Tier 3 — Maximum Edge (future)
+- Bayesian model weighting (skill-weighted by recent verification RMSE)
+- Nonhomogeneous Gaussian Regression (NGR) for simultaneous mean/spread correction
 - Station-specific microclimate adjustments
 
 ---
@@ -294,11 +300,11 @@ edge — ensemble forecasts vs. market mispricing on NO-side bets — is legitim
 ### Implication for Our Edge
 The market is becoming more efficient as tools proliferate. Edge is shrinking but still
 exists, especially through:
-1. **Better calibration** (NBM vs. raw GEFS — most competitors skip this)
+1. **Better calibration** (NWS anchor + automated WU calibration — most competitors use raw GEFS)
 2. **Faster data access** (direct S3 vs. API wrappers)
-3. **More ensemble members** (82+ vs. competitors using only 31)
-4. **Station-specific microclimate corrections**
-5. **Multi-model weighting** (not just equal-weight averaging)
+3. **More ensemble members** (143 vs. competitors using only 31)
+4. **Resolution source matching** (WU forecast anchoring — we predict what WU will report)
+5. **Multi-model four-layer correction** (NWS → calibration → HRRR → WU forecast)
 
 ---
 
@@ -316,7 +322,7 @@ exists, especially through:
 - **Action:** Monitor `https://www.emc.ncep.noaa.gov/emc/pages/numerical_forecast_systems/gefs.php`
   for HGEFS data availability announcements
 
-### NOAA NBM Deep Dive — The Underrated Edge
+### NOAA NBM Deep Dive — The Underrated Edge — **Status: Implemented (optional)**
 - **What:** National Blend of Models — fuses GEFS, GFS, ECMWF, HRRR, RAP, Canadian, and
   others into a single calibrated product
 - **Resolution:** 2.5 km CONUS (vs. 25 km for raw GEFS — **10x finer**)
@@ -336,10 +342,12 @@ exists, especially through:
   - Probabilistic: `blend_nbptx.tCCz`
 - **Why most competitors skip it:** Requires GRIB2 parsing (cfgrib) and station extraction.
   More complex than Open-Meteo JSON API. But the calibration quality is worth it.
-- **Implementation path:** Use `herbie-data` to download NBM GRIB2, extract MaxT percentiles
-  at exact airport coordinates, convert percentile distribution to bucket probabilities.
+- **Implementation:** Sidecar endpoint `GET /weather/nbm?city=NYC&date=YYYY-MM-DD`.
+  Uses Herbie to download NBM GRIB2, extract MaxT percentiles at airport coordinates.
+  Blended with ensemble KDE via `blend_probabilities()` (weight `WEATHER_NBM_WEIGHT`, default 0.6).
+  Optional — gracefully skipped if Herbie is not installed.
 
-### HRRR (High-Resolution Rapid Refresh) — Same-Day Edge
+### HRRR (High-Resolution Rapid Refresh) — Same-Day Edge — **Status: Implemented**
 - **What:** 3km resolution, convection-allowing model with radar assimilation
 - **Update:** Every hour (24 cycles/day)
 - **Forecast horizon:** 18 hours (48 hours on 00Z/06Z/12Z/18Z cycles)
@@ -347,20 +355,24 @@ exists, especially through:
   While competitors wait 6 hours between GEFS updates, HRRR gives hourly updates.
 - **Limitation:** Deterministic (single run), not ensemble. Use as a point estimate to
   anchor the KDE distribution, not as a replacement for ensemble probabilities.
-- **Access:** `s3://noaa-hrrr-pds/` — free on AWS
-- **Strategy:** On market day, weight HRRR heavily for the "most likely" temperature,
-  then use ensemble spread from GEFS/ECMWF for the uncertainty bands.
+- **Access:** Via Open-Meteo (`hrrr` model), plus `s3://noaa-hrrr-pds/` on AWS
+- **Implementation:** Sidecar endpoint `GET /weather/hrrr?city=NYC&date=YYYY-MM-DD`.
+  Applied as layer 3 of the four-layer bias correction (weight 0.3, same-day only).
+  Enabled via `same_day=true` query parameter on `/weather/probabilities`.
 
-### Multi-Model Super-Ensemble (133+ members)
-Open-Meteo provides additional ensemble models beyond our current GEFS + ECMWF:
+### Multi-Model Super-Ensemble (143 members) — **Status: Implemented**
+Open-Meteo serves four ensemble models in the current pipeline:
 - GEFS: 31 members
 - ECMWF IFS: 51 members
 - DWD ICON-EPS: 40 members
 - Canadian GEM: 21 members
+- **Currently active: 143 members**
+
+Additional models available but not yet integrated:
 - UK Met Office: 18 members
 - **Total available: 161 members**
 
-Not all members are equal — weight by recent verification skill using:
+**Future:** Weight by recent verification skill using:
 - **Bayesian Model Averaging (BMA):** Weighted mixture of model distributions
 - **Simple skill-weighting:** Track RMSE per model over rolling 30-day window, weight inversely
 
@@ -418,40 +430,34 @@ This builds the feedback loop that separates profitable bots from demo projects.
 
 ## Maximum Edge Strategies (Ranked by Impact)
 
-### 1. NBM Integration (Highest Value, Moderate Effort)
-Most competitors use raw GEFS which is underdispersive. NBM is already calibrated by NOAA
-against actual station observations. Integrating NBM percentiles as a secondary probability
-distribution — or as a calibration anchor for our KDE — would make our estimates more
-accurate than any raw-ensemble approach.
+### 1. NBM Integration — **Implemented**
+NBM percentiles blended with ensemble KDE via `blend_probabilities()`.
 
-**Implementation:** Add `GET /weather/nbm?city=NYC&date=YYYY-MM-DD` endpoint to sidecar.
-Use Herbie to download NBM GRIB2, extract MaxT percentiles at airport coordinates, return
-as bucket probabilities. Blend with ensemble KDE using a weighted average.
+**Endpoint:** `GET /weather/nbm?city=NYC&date=YYYY-MM-DD`. Uses Herbie for GRIB2 download.
+Optional — gracefully degrades if Herbie is not installed. Weight: `WEATHER_NBM_WEIGHT=0.6`.
 
-### 2. HRRR for Same-Day Markets (High Value, Low Effort)
-For markets resolving within 24 hours, HRRR's hourly 3km forecasts give a significant
-information advantage. Add an HRRR point-estimate fetch that anchors the ensemble
-distribution mean on market day.
+### 2. HRRR for Same-Day Markets — **Implemented**
+HRRR hourly 3km forecasts anchor the ensemble distribution mean on market day.
 
-**Implementation:** Add `GET /weather/hrrr?city=NYC` endpoint. Fetch latest HRRR via
-Herbie, extract 2m temperature at airport coordinates, return as JSON. Use to shift
-ensemble mean toward HRRR on same-day markets.
+**Endpoint:** `GET /weather/hrrr?city=NYC&date=YYYY-MM-DD`. Fetched via Open-Meteo.
+Applied as layer 3 of four-layer bias correction (weight 0.3). Enabled via `same_day=true`
+on `/weather/probabilities`. Only useful for same-day markets; longer-range should skip it.
 
-### 3. Multi-Model Ensemble (Medium Value, Low Effort)
-Expand from 82 members (GEFS+ECMWF) to 133+ by adding Canadian GEM (21) and DWD ICON-EPS
-(40) via Open-Meteo. More members = smoother KDE = better tail probability estimates.
+### 3. Multi-Model Ensemble — **Implemented**
+Expanded from 82 to 143 members by adding ICON-EPS (40) and GEM (21) via Open-Meteo.
 
-**Implementation:** Add `icon_seamless` and `gem_global` to Open-Meteo model list.
-Adjust `open_meteo.py` to parse additional model members.
+**Implementation:** Added `icon_seamless` and `gem_global` to Open-Meteo model list.
+`open_meteo.py` parses all four model outputs. More members = smoother KDE = better tail
+probability estimates.
 
-### 4. Automated Calibration Pipeline (High Value, High Effort)
-Track prediction vs. actual resolution over time. Automatically adjust:
-- Spread correction factor per city (some stations are more predictable than others)
-- Model weights (some models perform better in certain weather regimes)
-- Bucket probability biases (systematic over/under-estimation)
+### 4. Automated Calibration Pipeline — **Implemented**
+Tracks prediction vs. WU actual resolution. Per-city bias offset and spread factor
+auto-computed from historical data (needs 5+ observations to activate).
 
-**Implementation:** Nightly job that scrapes Weather Underground actuals, compares to
-stored predictions, updates calibration parameters in SQLite.
+**Implementation:** Rust calls `/weather/collect_actuals_batch` daily → stores in
+`weather_actuals` DB table. `/weather/calibrate` recomputes per-city parameters →
+saves to `calibration_params.json` → refreshed in-memory. Default bias offset of 4.0°F
+bridges the gap until auto-calibration kicks in.
 
 ### 5. Direct S3 Access via Herbie (Medium Value, Medium Effort)
 Eliminates Open-Meteo as intermediary. Benefits:
@@ -463,13 +469,16 @@ Eliminates Open-Meteo as intermediary. Benefits:
 **Implementation:** Replace Open-Meteo calls in `open_meteo.py` with Herbie-based
 GRIB2 downloads. Or keep Open-Meteo for GEFS/ECMWF and add Herbie only for NBM/HRRR.
 
-### 6. Weather Underground Monitoring (Medium Value, Low Effort)
-Since Polymarket resolves via WU, monitoring actual WU observations on market day
-provides last-minute edge. If WU shows the temperature has already hit 72°F by 2pm,
-the "70-72°F or higher" bucket is locked in — sell any YES on lower buckets.
+### 6. Weather Underground Monitoring — **Implemented**
+WU observations fetched via Weather.com JSON API (WU is an Angular SPA — HTML scraping
+returns empty shell). Provides both historical actuals and 5-day forecast highs.
 
-**Implementation:** Periodic scrape of WU current conditions for all 22 stations.
-Use as a real-time constraint on same-day market positions.
+**Implementation:** `wu_scraper.py` uses `api.weather.com` endpoints:
+- Actuals: `/v1/location/{ICAO}:9:US/observations/historical.json` (daily high = max of hourly temps)
+- Forecast: `/v3/wx/forecast/daily/5day` (5-day forecast highs by geocode)
+Sidecar endpoints: `GET /weather/wu_actual`, `POST /weather/collect_actual`,
+`POST /weather/collect_actuals_batch`. WU forecast applied as layer 4 of bias correction
+(weight 0.25).
 
 ---
 

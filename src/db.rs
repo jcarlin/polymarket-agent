@@ -973,7 +973,22 @@ impl Database {
             [],
         );
 
+        // Backfill: add source column to weather_actuals
+        let _ = self.conn.execute(
+            "ALTER TABLE weather_actuals ADD COLUMN source TEXT DEFAULT 'organic'",
+            [],
+        );
+
         Ok(())
+    }
+
+    /// Count total rows in weather_actuals table.
+    pub fn count_weather_actuals(&self) -> Result<i64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM weather_actuals", [], |r| r.get(0))
+            .context("count weather_actuals")?;
+        Ok(count)
     }
 }
 
@@ -1476,5 +1491,42 @@ mod tests {
             .unwrap();
         let losses = db.get_weather_losses_today();
         assert!((losses - 2.50).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_count_weather_actuals() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.count_weather_actuals().unwrap(), 0);
+
+        db.insert_weather_actual("NYC", "2026-02-01", Some(35.0), None, Some(33.0), None, None, None)
+            .unwrap();
+        db.insert_weather_actual("NYC", "2026-02-02", Some(38.0), None, Some(36.0), None, None, None)
+            .unwrap();
+        assert_eq!(db.count_weather_actuals().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_source_column_migration() {
+        let db = Database::open_in_memory().unwrap();
+        // Running migrations again should not fail (ALTER TABLE is idempotent via let _ = ...)
+        db.run_migrations().unwrap();
+
+        // Verify source column exists by inserting with it
+        db.conn
+            .execute(
+                "INSERT INTO weather_actuals (city, forecast_date, wu_actual_high, source) VALUES ('NYC', '2026-01-01', 35.0, 'backfill_gfs')",
+                [],
+            )
+            .unwrap();
+
+        let source: String = db
+            .conn
+            .query_row(
+                "SELECT source FROM weather_actuals WHERE city = 'NYC' AND forecast_date = '2026-01-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "backfill_gfs");
     }
 }

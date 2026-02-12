@@ -139,6 +139,32 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Bootstrap calibration: backfill historical weather data if DB is sparse
+    if let Some(ref wc) = weather_client {
+        let actuals_count = db.count_weather_actuals()?;
+        if actuals_count < 100 {
+            info!(
+                "Insufficient calibration data ({} rows, need ~100), running backfill...",
+                actuals_count,
+            );
+            match wc.backfill(10).await {
+                Ok(rows) => {
+                    info!("Backfill complete: {} rows inserted", rows);
+                    match wc.trigger_calibration().await {
+                        Ok(n) => info!("Post-backfill calibration: {} cities calibrated", n),
+                        Err(e) => warn!("Post-backfill calibration failed: {}", e),
+                    }
+                }
+                Err(e) => warn!("Backfill failed (non-fatal, will retry next startup): {}", e),
+            }
+        } else {
+            info!(
+                "Calibration data sufficient ({} rows), skipping backfill",
+                actuals_count
+            );
+        }
+    }
+
     let estimator = if config.anthropic_api_key.is_empty() {
         warn!("ANTHROPIC_API_KEY not set — skipping Claude analysis");
         None

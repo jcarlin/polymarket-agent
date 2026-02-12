@@ -14,27 +14,50 @@ from weather.calibration import (
 )
 
 
-def _create_test_db(rows: list[tuple], include_nws: bool = False) -> str:
+def _create_test_db(
+    rows: list[tuple],
+    include_nws: bool = False,
+    include_source: bool = False,
+) -> str:
     """Create a temp SQLite DB with weather_actuals table and return path.
 
-    If include_nws=True, rows should be (city, date, wu_actual_high, ensemble_mean, nws_forecast_high).
+    If include_source=True, rows should include source as the last element.
+    If include_nws=True (and not include_source), rows are
+        (city, date, wu_actual_high, ensemble_mean, nws_forecast_high).
     Otherwise rows are (city, date, wu_actual_high, ensemble_mean) with nws_forecast_high=NULL.
     """
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE weather_actuals "
-        "(city TEXT, date TEXT, wu_actual_high REAL, ensemble_mean REAL, "
-        "nws_forecast_high REAL)"
-    )
-    if include_nws:
+    if include_source:
+        conn.execute(
+            "CREATE TABLE weather_actuals "
+            "(city TEXT, date TEXT, wu_actual_high REAL, ensemble_mean REAL, "
+            "nws_forecast_high REAL, source TEXT DEFAULT 'organic')"
+        )
+        conn.executemany(
+            "INSERT INTO weather_actuals "
+            "(city, date, wu_actual_high, ensemble_mean, nws_forecast_high, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    elif include_nws:
+        conn.execute(
+            "CREATE TABLE weather_actuals "
+            "(city TEXT, date TEXT, wu_actual_high REAL, ensemble_mean REAL, "
+            "nws_forecast_high REAL)"
+        )
         conn.executemany(
             "INSERT INTO weather_actuals (city, date, wu_actual_high, ensemble_mean, nws_forecast_high) "
             "VALUES (?, ?, ?, ?, ?)",
             rows,
         )
     else:
+        conn.execute(
+            "CREATE TABLE weather_actuals "
+            "(city TEXT, date TEXT, wu_actual_high REAL, ensemble_mean REAL, "
+            "nws_forecast_high REAL)"
+        )
         conn.executemany(
             "INSERT INTO weather_actuals (city, date, wu_actual_high, ensemble_mean) "
             "VALUES (?, ?, ?, ?)",
@@ -103,9 +126,13 @@ def test_compute_calibration_multiple_cities():
         os.unlink(db_path)
 
 
-def test_compute_calibration_prefers_nws_over_ensemble():
-    """When nws_forecast_high is available, bias should be computed against NWS, not ensemble."""
-    # NWS says 38, ensemble says 32, actual is 42 → bias vs NWS = +4, bias vs ensemble = +10
+def test_compute_calibration_uses_blended_prediction():
+    """When both NWS and ensemble are available, bias should be computed against the
+    pipeline's NWS-weighted blend (0.85*NWS + 0.15*ensemble), not NWS alone."""
+    # NWS says 38, ensemble says 32, actual is 42
+    # Old formula: bias = actual - NWS = 42 - 38 = +4.0
+    # New formula: predicted = 0.85*38 + 0.15*32 = 32.3 + 4.8 = 37.1
+    #              bias = 42 - 37.1 = +4.9
     rows = []
     for i in range(6):
         # (city, date, wu_actual_high, ensemble_mean, nws_forecast_high)
@@ -115,9 +142,12 @@ def test_compute_calibration_prefers_nws_over_ensemble():
     try:
         result = compute_calibration(db_path)
         assert "NYC" in result
-        # Bias should be ~4.0 (actual - nws), NOT ~10.0 (actual - ensemble)
-        assert 3.5 < result["NYC"].bias_offset < 4.5, \
-            f"Bias {result['NYC'].bias_offset} should be ~4.0 (actual - NWS)"
+        # predicted = 0.85*38 + 0.15*32 = 37.1, bias = 42 - 37.1 = 4.9
+        expected_bias = 42.0 - (0.85 * 38.0 + 0.15 * 32.0)
+        assert abs(result["NYC"].bias_offset - expected_bias) < 0.01, \
+            f"Bias {result['NYC'].bias_offset} should be ~{expected_bias:.1f} (actual - blended)"
+        # Should be larger than old NWS-only bias of 4.0
+        assert result["NYC"].bias_offset > 4.0
     finally:
         os.unlink(db_path)
 
@@ -211,3 +241,188 @@ def test_load_calibration_invalid_json():
         assert result == {}
     finally:
         os.unlink(path)
+
+
+def test_compute_calibration_weighted_backfill():
+    """Backfilled rows should contribute less weight than organic rows."""
+    # 3 organic rows: actual=50, predicted=45 -> bias=+5
+    # 4 backfill rows: actual=50, predicted=40 -> bias=+10
+    # Effective n = 3*1.0 + 4*0.6 = 5.4 >= 5 (passes MIN_OBSERVATIONS)
+    # Weighted bias should be closer to +5 (organic) than +10 (backfill)
+    rows = []
+    for i in range(3):
+        rows.append(("NYC", f"2026-01-{i + 1:02d}", 50.0, 45.0, None, "organic"))
+    for i in range(4):
+        rows.append(("NYC", f"2026-01-{i + 10:02d}", 50.0, 40.0, None, "backfill_gfs"))
+
+    db_path = _create_test_db(rows, include_source=True)
+    try:
+        result = compute_calibration(db_path)
+        assert "NYC" in result
+        params = result["NYC"]
+        assert params.sample_size == 7
+        # Organic-only bias = 5.0, backfill-only bias = 10.0
+        # Weighted: (3*5.0 + 4*0.6*10.0) / (3 + 4*0.6) = (15 + 24) / 5.4 = 7.22...
+        expected_bias = (3 * 5.0 + 4 * 0.6 * 10.0) / (3 + 4 * 0.6)
+        assert abs(params.bias_offset - expected_bias) < 0.01, \
+            f"Bias {params.bias_offset} should be ~{expected_bias:.2f}"
+        # Should be closer to 5 (organic) than 10 (backfill)
+        assert params.bias_offset < 10.0
+        assert params.bias_offset > 5.0
+    finally:
+        os.unlink(db_path)
+
+
+def test_compute_calibration_backfill_only_insufficient():
+    """8 backfill rows = 8*0.6 = 4.8 effective, should be insufficient."""
+    rows = []
+    for i in range(8):
+        rows.append(("NYC", f"2026-01-{i + 1:02d}", 50.0, 45.0, None, "backfill_gfs"))
+
+    db_path = _create_test_db(rows, include_source=True)
+    try:
+        result = compute_calibration(db_path)
+        assert "NYC" not in result, (
+            "8 backfill rows (effective=4.8) should be insufficient"
+        )
+    finally:
+        os.unlink(db_path)
+
+
+def test_compute_calibration_backfill_sufficient_at_nine():
+    """9 backfill rows = 9*0.6 = 5.4 effective, should be sufficient."""
+    rows = []
+    for i in range(9):
+        rows.append(("NYC", f"2026-01-{i + 1:02d}", 50.0, 45.0, None, "backfill_gfs"))
+
+    db_path = _create_test_db(rows, include_source=True)
+    try:
+        result = compute_calibration(db_path)
+        assert "NYC" in result, (
+            "9 backfill rows (effective=5.4) should be sufficient"
+        )
+        assert abs(result["NYC"].bias_offset - 5.0) < 0.01
+    finally:
+        os.unlink(db_path)
+
+
+def test_compute_calibration_no_source_column():
+    """Backward compat: DB without source column treats all rows as organic (weight 1.0)."""
+    rows = []
+    for i in range(6):
+        rows.append(("NYC", f"2026-01-{i + 1:02d}", 42.0, 38.0))
+
+    # No source column in this DB
+    db_path = _create_test_db(rows, include_nws=False, include_source=False)
+    try:
+        result = compute_calibration(db_path)
+        assert "NYC" in result
+        # All treated as organic weight 1.0, so 6 observations >= 5
+        assert result["NYC"].sample_size == 6
+        assert abs(result["NYC"].bias_offset - 4.0) < 0.01
+    finally:
+        os.unlink(db_path)
+
+
+def test_backfill_idempotency():
+    """Inserting rows with upsert should not create duplicates."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE weather_actuals "
+        "(city TEXT, forecast_date TEXT, wu_actual_high REAL, ensemble_mean REAL, "
+        "nws_forecast_high REAL, predicted_bucket TEXT, actual_bucket TEXT, "
+        "prediction_error REAL, source TEXT DEFAULT 'organic', "
+        "UNIQUE(city, forecast_date))"
+    )
+
+    # Insert a backfill row
+    conn.execute(
+        """INSERT INTO weather_actuals
+           (city, forecast_date, wu_actual_high, ensemble_mean, source)
+           VALUES (?, ?, ?, ?, ?)""",
+        ("NYC", "2026-01-15", 42.0, 38.0, "backfill_gfs"),
+    )
+    conn.commit()
+
+    # Insert again (upsert) -- should not create a duplicate
+    conn.execute(
+        """INSERT INTO weather_actuals
+           (city, forecast_date, wu_actual_high, ensemble_mean, source)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(city, forecast_date) DO UPDATE SET
+             wu_actual_high = COALESCE(excluded.wu_actual_high, wu_actual_high),
+             ensemble_mean = COALESCE(excluded.ensemble_mean, ensemble_mean),
+             source = CASE WHEN weather_actuals.source = 'organic'
+                           THEN weather_actuals.source
+                           ELSE excluded.source END""",
+        ("NYC", "2026-01-15", 43.0, 39.0, "backfill_gfs"),
+    )
+    conn.commit()
+
+    cursor = conn.execute(
+        "SELECT COUNT(*) FROM weather_actuals WHERE city='NYC' AND forecast_date='2026-01-15'"
+    )
+    count = cursor.fetchone()[0]
+    assert count == 1, f"Expected 1 row, got {count} (upsert should prevent duplicates)"
+
+    # Verify the values were updated (COALESCE with non-null values updates)
+    cursor = conn.execute(
+        "SELECT wu_actual_high, ensemble_mean, source FROM weather_actuals "
+        "WHERE city='NYC' AND forecast_date='2026-01-15'"
+    )
+    row = cursor.fetchone()
+    assert row[0] == 43.0, "wu_actual_high should be updated to 43.0"
+    assert row[1] == 39.0, "ensemble_mean should be updated to 39.0"
+    assert row[2] == "backfill_gfs", "source should remain backfill_gfs"
+
+    conn.close()
+    os.unlink(path)
+
+
+def test_backfill_organic_source_preserved():
+    """Organic source should not be overwritten by backfill upsert."""
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE weather_actuals "
+        "(city TEXT, forecast_date TEXT, wu_actual_high REAL, ensemble_mean REAL, "
+        "nws_forecast_high REAL, predicted_bucket TEXT, actual_bucket TEXT, "
+        "prediction_error REAL, source TEXT DEFAULT 'organic', "
+        "UNIQUE(city, forecast_date))"
+    )
+
+    # Insert an organic row first
+    conn.execute(
+        """INSERT INTO weather_actuals
+           (city, forecast_date, wu_actual_high, ensemble_mean, source)
+           VALUES (?, ?, ?, ?, ?)""",
+        ("NYC", "2026-01-15", 42.0, 38.0, "organic"),
+    )
+    conn.commit()
+
+    # Backfill upsert should NOT overwrite the organic source
+    conn.execute(
+        """INSERT INTO weather_actuals
+           (city, forecast_date, wu_actual_high, ensemble_mean, source)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(city, forecast_date) DO UPDATE SET
+             wu_actual_high = COALESCE(excluded.wu_actual_high, wu_actual_high),
+             ensemble_mean = COALESCE(excluded.ensemble_mean, ensemble_mean),
+             source = CASE WHEN weather_actuals.source = 'organic'
+                           THEN weather_actuals.source
+                           ELSE excluded.source END""",
+        ("NYC", "2026-01-15", 43.0, 39.0, "backfill_gfs"),
+    )
+    conn.commit()
+
+    cursor = conn.execute(
+        "SELECT source FROM weather_actuals WHERE city='NYC' AND forecast_date='2026-01-15'"
+    )
+    row = cursor.fetchone()
+    assert row[0] == "organic", "Organic source should be preserved on upsert"
+
+    conn.close()
+    os.unlink(path)

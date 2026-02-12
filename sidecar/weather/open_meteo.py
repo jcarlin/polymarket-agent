@@ -11,6 +11,7 @@ logger = logging.getLogger("weather.open_meteo")
 
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 
 
 @dataclass
@@ -356,6 +357,83 @@ async def fetch_hrrr(
     except Exception as e:
         logger.warning("HRRR fetch unexpected error for %s: %s", city, e)
         return None
+    finally:
+        if close_session:
+            await session.aclose()
+
+
+async def fetch_historical_forecast_high(
+    city: str,
+    start_date: str,
+    end_date: str,
+    session: Optional[httpx.AsyncClient] = None,
+    max_retries: int = 3,
+) -> dict[str, float]:
+    """Fetch historical GFS forecast daily highs from Open-Meteo Historical Forecast API.
+
+    Returns dict mapping YYYY-MM-DD -> forecast high in Fahrenheit.
+    """
+    config = CITY_CONFIGS.get(city)
+    if config is None:
+        logger.warning("fetch_historical_forecast_high: unknown city %s", city)
+        return {}
+
+    params = {
+        "latitude": config.lat,
+        "longitude": config.lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "temperature_2m_max",
+        "temperature_unit": "fahrenheit",
+        "timezone": config.timezone,
+    }
+
+    close_session = False
+    if session is None:
+        session = httpx.AsyncClient(timeout=30.0)
+        close_session = True
+
+    try:
+        last_err: Optional[Exception] = None
+        resp = None
+        for attempt in range(max_retries):
+            try:
+                resp = await session.get(
+                    OPEN_METEO_HISTORICAL_FORECAST_URL, params=params
+                )
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+        else:
+            logger.error(
+                "Historical forecast fetch failed for %s after %d retries: %s",
+                city, max_retries, last_err,
+            )
+            return {}
+
+        data = resp.json()
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
+        temps = daily.get("temperature_2m_max", [])
+
+        result: dict[str, float] = {}
+        for d, t in zip(dates, temps):
+            if t is not None:
+                result[d] = float(t)
+
+        logger.info(
+            "Historical forecast for %s (%s to %s): %d days",
+            city, start_date, end_date, len(result),
+        )
+        return result
+    except Exception as e:
+        logger.warning(
+            "Historical forecast unexpected error for %s: %s", city, e
+        )
+        return {}
     finally:
         if close_session:
             await session.aclose()

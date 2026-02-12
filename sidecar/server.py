@@ -1,14 +1,22 @@
+import asyncio
 import logging
 import os
+import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from polymarket_client import PolymarketClient
-from weather.open_meteo import CITY_CONFIGS, fetch_ensemble, fetch_hrrr, fetch_nws_for_city
+from weather.open_meteo import (
+    CITY_CONFIGS,
+    fetch_ensemble,
+    fetch_hrrr,
+    fetch_historical_forecast_high,
+    fetch_nws_for_city,
+)
 from weather.probability_model import blend_probabilities, compute_bucket_probabilities
 
 logger = logging.getLogger("sidecar")
@@ -261,15 +269,27 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
     except Exception as e:
         logger.debug("WU forecast fetch for %s/%s: %s", city, date, e)
 
-    # Determine calibration bias: per-city from calibration data, else default
+    # Determine calibration bias: blend per-city calibration with default
+    # based on sample confidence. With small/backfill-only samples, the computed
+    # bias can be too small (backfill uses GFS deterministic, not the multi-model
+    # ensemble the live pipeline uses). Blending toward the default prevents
+    # regression until enough organic observations accumulate.
+    CAL_CONFIDENT_SAMPLES = 30  # full confidence at 30+ samples per city
     cal_bias = None
     cal_spread = None
     if city in _calibration_params:
         cal = _calibration_params[city]
-        cal_bias = cal.bias_offset
         cal_spread = cal.spread_factor
-        logger.info("Using calibration for %s: bias=%.2f, spread=%.2f (n=%d)",
-                     city, cal_bias, cal_spread, cal.sample_size)
+        confidence = min(cal.sample_size / CAL_CONFIDENT_SAMPLES, 1.0)
+        if WEATHER_DEFAULT_BIAS_OFFSET != 0.0 and confidence < 1.0:
+            cal_bias = confidence * cal.bias_offset + (1.0 - confidence) * WEATHER_DEFAULT_BIAS_OFFSET
+            logger.info("Using blended calibration for %s: bias=%.2f (cal=%.2f, default=%.1f, confidence=%.0f%%, n=%d)",
+                         city, cal_bias, cal.bias_offset, WEATHER_DEFAULT_BIAS_OFFSET,
+                         confidence * 100, cal.sample_size)
+        else:
+            cal_bias = cal.bias_offset
+            logger.info("Using calibration for %s: bias=%.2f, spread=%.2f (n=%d)",
+                         city, cal_bias, cal_spread, cal.sample_size)
     elif WEATHER_DEFAULT_BIAS_OFFSET != 0.0:
         cal_bias = WEATHER_DEFAULT_BIAS_OFFSET
         logger.info("Using default bias offset for %s: +%.1f°F", city, cal_bias)
@@ -503,7 +523,7 @@ async def weather_calibrate(db_path: str = DATABASE_PATH):
     try:
         from weather.calibration import compute_calibration, save_calibration
 
-        params = compute_calibration(db_path)
+        params = compute_calibration(db_path, nws_weight=WEATHER_NWS_WEIGHT)
         save_calibration(params, "calibration_params.json")
         _calibration_params = params  # Refresh in-memory params
         return {
@@ -661,6 +681,150 @@ async def collect_actuals_batch(date: str | None = None) -> CollectBatchResponse
         collected=collected,
         failed=failed,
         results=results,
+    )
+
+
+class BackfillRequest(BaseModel):
+    days_back: int = 10
+    force: bool = False
+
+
+class BackfillResponse(BaseModel):
+    cities_processed: int
+    rows_inserted: int
+    errors: int
+
+
+@app.post("/weather/backfill", response_model=BackfillResponse)
+async def weather_backfill(req: BackfillRequest) -> BackfillResponse:
+    """Backfill weather_actuals with historical GFS forecast highs and WU actuals."""
+    global _calibration_params
+
+    today = datetime.utcnow().date()
+    start_date = (today - timedelta(days=req.days_back)).strftime("%Y-%m-%d")
+    end_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    cities_processed = 0
+    rows_inserted = 0
+    errors = 0
+
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
+
+    # Idempotently add source column if it does not exist
+    try:
+        conn.execute(
+            "ALTER TABLE weather_actuals ADD COLUMN source TEXT DEFAULT 'organic'"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    for city_code in CITY_CONFIGS:
+        config = CITY_CONFIGS[city_code]
+
+        # Fetch GFS historical forecast highs for entire date range (1 API call)
+        try:
+            gfs_highs = await fetch_historical_forecast_high(
+                city_code, start_date, end_date
+            )
+        except Exception as e:
+            logger.warning(
+                "Backfill: historical forecast fetch failed for %s: %s",
+                city_code, e,
+            )
+            errors += 1
+            continue
+
+        # For each date in the range, fetch WU actual and insert row
+        d = today - timedelta(days=req.days_back)
+        while d < today:
+            date_str = d.strftime("%Y-%m-%d")
+            d += timedelta(days=1)
+
+            gfs_high = gfs_highs.get(date_str)
+
+            # Fetch WU actual
+            wu_high = None
+            try:
+                from weather.wu_scraper import fetch_wu_actual
+                wu_high = await fetch_wu_actual(config.icao, date_str)
+            except ImportError:
+                logger.debug("WU scraper not available for backfill")
+            except Exception as e:
+                logger.debug(
+                    "Backfill: WU fetch failed for %s/%s: %s",
+                    city_code, date_str, e,
+                )
+
+            if wu_high is not None:
+                try:
+                    actual_bucket = _temp_to_bucket_label(wu_high)
+                    predicted_bucket = (
+                        _temp_to_bucket_label(gfs_high) if gfs_high else None
+                    )
+                    prediction_error = (
+                        (gfs_high - wu_high) if gfs_high else None
+                    )
+                    conn.execute(
+                        """INSERT INTO weather_actuals
+                           (city, forecast_date, wu_actual_high, ensemble_mean,
+                            nws_forecast_high, predicted_bucket, actual_bucket,
+                            prediction_error, source)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(city, forecast_date) DO UPDATE SET
+                             wu_actual_high = COALESCE(excluded.wu_actual_high, wu_actual_high),
+                             ensemble_mean = COALESCE(excluded.ensemble_mean, ensemble_mean),
+                             predicted_bucket = COALESCE(excluded.predicted_bucket, predicted_bucket),
+                             actual_bucket = COALESCE(excluded.actual_bucket, actual_bucket),
+                             prediction_error = COALESCE(excluded.prediction_error, prediction_error),
+                             source = CASE WHEN weather_actuals.source = 'organic'
+                                           THEN weather_actuals.source
+                                           ELSE excluded.source END""",
+                        (
+                            city_code, date_str, wu_high, gfs_high,
+                            None, predicted_bucket, actual_bucket,
+                            prediction_error, "backfill_gfs",
+                        ),
+                    )
+                    conn.commit()
+                    rows_inserted += 1
+                except Exception as e:
+                    logger.error(
+                        "Backfill: failed to store row for %s/%s: %s",
+                        city_code, date_str, e,
+                    )
+                    errors += 1
+
+            # Rate limit WU calls
+            await asyncio.sleep(0.5)
+
+        cities_processed += 1
+        # Rate limit between cities
+        await asyncio.sleep(1.0)
+
+    conn.close()
+
+    # Trigger calibration refresh
+    try:
+        from weather.calibration import compute_calibration, save_calibration
+
+        params = compute_calibration(DATABASE_PATH, nws_weight=WEATHER_NWS_WEIGHT)
+        save_calibration(params, "calibration_params.json")
+        _calibration_params = params
+        logger.info(
+            "Backfill: recalibrated %d cities after backfill", len(params)
+        )
+    except Exception as e:
+        logger.warning("Backfill: calibration refresh failed: %s", e)
+
+    logger.info(
+        "Backfill complete: %d cities, %d rows inserted, %d errors",
+        cities_processed, rows_inserted, errors,
+    )
+    return BackfillResponse(
+        cities_processed=cities_processed,
+        rows_inserted=rows_inserted,
+        errors=errors,
     )
 
 

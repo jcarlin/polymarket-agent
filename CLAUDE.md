@@ -17,7 +17,7 @@ After completing a phase, run `/next-phase` to advance.
 ## Tech Stack
 
 - **Rust** (core agent: scheduler, analysis orchestration, risk management, dashboard)
-- **Python sidecar** (FastAPI on localhost:9090 — Polymarket trading via `py-clob-client`, weather data via Open-Meteo + GEFS)
+- **Python sidecar** (FastAPI on localhost:9090 — Polymarket trading via `py-clob-client`, weather data via Open-Meteo + NWS + HRRR + WU)
 - **SQLite** (trade journal, position history, bankroll ledger)
 - **Single-file HTML dashboard** (vanilla JS + Chart.js CDN, no build step)
 
@@ -64,8 +64,11 @@ polymarket-agent/
 │   ├── server.py                       # FastAPI app on localhost:9090
 │   ├── polymarket_client.py            # py-clob-client wrapper (order signing, positions)
 │   └── weather/
-│       ├── open_meteo.py               # Open-Meteo Ensemble API client (GEFS + ECMWF)
-│       └── probability_model.py        # Ensemble members → 2°F bucket probabilities (scipy KDE)
+│       ├── open_meteo.py               # Open-Meteo Ensemble API client (GEFS + ECMWF + ICON + GEM)
+│       ├── probability_model.py        # Multi-model KDE → 2°F bucket probabilities (NWS-anchored)
+│       ├── wu_scraper.py               # Weather.com JSON API for actuals + 5-day forecast
+│       ├── calibration.py              # Per-city bias/spread from historical WU actuals
+│       └── nbm.py                      # NBM percentile integration (optional, via Herbie)
 ├── prompts/
 │   └── fair_value.md                   # Claude prompt template
 ├── static/
@@ -167,29 +170,48 @@ Default settings produce ~$109/day in Claude costs. **$50 bankroll dies in 11 ho
 
 **See `docs/weather-research.md` for full feasibility research.**
 
-Core approach: Open-Meteo Ensemble API serves all 31 GEFS members + 51 ECMWF members
-as JSON. No GRIB2 parsing needed for MVP. Gaussian KDE over 82 ensemble members →
-probability distribution over 2°F temperature buckets → compare vs Polymarket prices.
+**Multi-model ensemble:** Open-Meteo serves GEFS (31) + ECMWF (51) + ICON (40) + GEM (21) =
+**143 ensemble members** as JSON. Gaussian KDE over all members → probability distribution
+over 2°F temperature buckets → compare vs Polymarket prices.
+
+**Four-layer bias correction pipeline** (order matters — each shift is relative to current mean):
+1. **NWS anchor** (weight 0.85): `api.weather.gov` point forecast blended with raw ensemble mean
+2. **Calibration bias**: Per-city offset learned from historical WU actuals vs predictions (needs 5+ observations)
+3. **HRRR shift** (weight 0.3): Hourly 3km deterministic forecast for same-day markets only
+4. **WU forecast anchor** (weight 0.25): Weather.com 5-day forecast nudge (resolution source matching)
+
+**Default bias offset:** `WEATHER_DEFAULT_BIAS_OFFSET=4.0` bridges the NWS→WU gap until
+auto-calibration accumulates enough data per city.
+
+**Automated calibration loop:** Rust calls sidecar `/weather/collect_actuals_batch` daily to
+fetch WU actual highs for all cities, stores in `weather_actuals` table. Sidecar
+`/weather/calibrate` recomputes per-city bias/spread from historical data.
 
 **Key trade:** When market prices outcome >3% but ensemble model says <1% → buy NO at 98-99¢.
 
-**Resolution source:** Weather Underground data for specific airport METAR stations
-(KLGA for NYC, KORD for Chicago, etc.). Model must predict at exact airport coordinates.
+**Resolution source:** Weather Underground (Weather.com JSON API) for specific airport METAR
+stations (KLGA for NYC, KORD for Chicago, etc.). WU is an Angular SPA — use the JSON API
+(`api.weather.com/v1/location/{ICAO}:9:US/observations/historical.json`), not HTML scraping.
 
 **20 US cities in parallel** for natural diversification. Nearby cities (NYC/PHL/BOS)
 treated as partially correlated for exposure limits.
 
 ---
 
-## Kelly Criterion Position Sizing
+## Kelly Criterion Position Sizing (Fee-Adjusted)
 
+All sizing math accounts for trading fees via `TRADING_FEE_RATE` (default 2%):
 ```
-kelly_fraction = (edge / odds) - ((1 - edge) / (payout - 1))
+effective_buy = buy_price * (1 + fee_rate)
+effective_payout = 1.0 - fee_rate
+edge = model_prob * effective_payout - effective_buy
+kelly_fraction = edge / (effective_payout - effective_buy)
 position_size = min(kelly_fraction * bankroll * KELLY_FRACTION, MAX_POSITION_PCT * bankroll)
 ```
 - Use half-Kelly (KELLY_FRACTION=0.5) to reduce variance
 - Hard cap at 6% of bankroll per position
 - Never bet if Kelly suggests negative sizing
+- Stop-loss and take-profit thresholds are also fee-adjusted
 
 ---
 
@@ -290,13 +312,20 @@ Paper mode is a 24-48h smoke test, not a backtesting sandbox.
 - Tests for survival math edge cases
 
 ### Phase 5 — Weather Pipeline (Highest Edge)
-- sidecar/weather/open_meteo.py: Open-Meteo Ensemble API for GEFS (31 members) + ECMWF (51 members)
-- sidecar/weather/probability_model.py: scipy KDE → 2°F bucket probabilities
-- FastAPI endpoint: GET /weather/probabilities?city=NYC&date=YYYY-MM-DD
-- Direct GEFS/ECMWF from AWS S3 as Tier 2 upgrade (Herbie library)
+- Multi-model ensemble via Open-Meteo: GEFS (31) + ECMWF (51) + ICON (40) + GEM (21) = 143 members
+- NWS point forecast integration (`api.weather.gov`) as primary anchor (weight 0.85)
+- HRRR same-day forecasts via Open-Meteo (hourly 3km, weight 0.3)
+- WU scraper: Weather.com JSON API for actuals + 5-day forecast anchoring
+- Calibration module: per-city bias/spread from historical WU resolution data
+- NBM percentile integration (optional, via Herbie library)
+- Four-layer bias correction: NWS → calibration → HRRR → WU forecast
+- Sidecar endpoints: `/weather/probabilities`, `/weather/wu_actual`, `/weather/validate`,
+  `/weather/hrrr`, `/weather/nbm`, `/weather/calibration`, `/weather/calibrate`,
+  `/weather/collect_actual`, `/weather/collect_actuals_batch`
+- `weather_actuals` and `weather_calibration` DB tables
 - 20-city parallel fetching, airport coordinate targeting
 - Weather-specific NO-side trade logic
-- Tests for probability model accuracy
+- Tests for probability model, calibration, WU scraper accuracy
 
 ### Phase 6 — Position Management & Risk
 - position_manager.rs: stop-loss, take-profit, edge re-evaluation
