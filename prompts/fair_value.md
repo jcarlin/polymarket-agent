@@ -28,6 +28,9 @@ of an outcome, independent of what the market currently prices it at.
 - **Combined ensemble mean daily high:** {{ensemble_mean}}°F
 - **Combined ensemble std dev:** {{ensemble_std}}°F
 - **Model probability for this outcome:** {{model_probability}}%
+  *(This is the pre-computed cumulative probability from 143 ensemble members
+  after bias correction. Treat this as your primary estimate. Adjust by at most
+  ±5 percentage points for qualitative factors not captured by the model.)*
 {{/if}}
 
 {{#if sports_data}}

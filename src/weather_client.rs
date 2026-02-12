@@ -553,24 +553,42 @@ pub fn get_weather_model_probability(
     info: &WeatherMarketInfo,
     probs: &WeatherProbabilities,
 ) -> Option<f64> {
-    // For "X or above" type markets, sum all buckets >= lower
+    // For "X or above" type markets, sum buckets with proportional overlap at boundary
     if info.bucket_upper >= 130.0 {
         let total: f64 = probs
             .buckets
             .iter()
-            .filter(|b| b.lower >= info.bucket_lower)
-            .map(|b| b.probability)
+            .map(|b| {
+                if b.lower >= info.bucket_lower {
+                    b.probability // fully included
+                } else if b.upper > info.bucket_lower {
+                    // boundary bucket: proportional overlap
+                    let overlap = (b.upper - info.bucket_lower) / (b.upper - b.lower);
+                    b.probability * overlap
+                } else {
+                    0.0 // fully excluded
+                }
+            })
             .sum();
         return Some(total);
     }
 
-    // For "below X" type markets, sum all buckets < upper
+    // For "below X" type markets, sum buckets with proportional overlap at boundary
     if info.bucket_lower <= -59.0 {
         let total: f64 = probs
             .buckets
             .iter()
-            .filter(|b| b.upper <= info.bucket_upper)
-            .map(|b| b.probability)
+            .map(|b| {
+                if b.upper <= info.bucket_upper {
+                    b.probability // fully included
+                } else if b.lower < info.bucket_upper {
+                    // boundary bucket: proportional overlap
+                    let overlap = (info.bucket_upper - b.lower) / (b.upper - b.lower);
+                    b.probability * overlap
+                } else {
+                    0.0 // fully excluded
+                }
+            })
             .sum();
         return Some(total);
     }
@@ -821,6 +839,164 @@ mod tests {
         let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
         let rows = client.backfill(10).await.unwrap();
         assert_eq!(rows, 150);
+    }
+
+    #[test]
+    fn test_get_weather_model_probability_below_boundary() {
+        // "33°F or below" with 2°F buckets: [30-32)=3%, [32-34)=10%, [34-36)=5%
+        // 33 falls in [32-34), so we get: 3% full + 50% of 10% = 3% + 5% = 8%
+        let probs = WeatherProbabilities {
+            city: "NYC".to_string(),
+            station_icao: "KLGA".to_string(),
+            forecast_date: "2026-02-13".to_string(),
+            buckets: vec![
+                BucketProbability {
+                    bucket_label: "30-32".to_string(),
+                    lower: 30.0,
+                    upper: 32.0,
+                    probability: 0.03,
+                },
+                BucketProbability {
+                    bucket_label: "32-34".to_string(),
+                    lower: 32.0,
+                    upper: 34.0,
+                    probability: 0.10,
+                },
+                BucketProbability {
+                    bucket_label: "34-36".to_string(),
+                    lower: 34.0,
+                    upper: 36.0,
+                    probability: 0.05,
+                },
+            ],
+            ensemble_mean: 37.3,
+            ensemble_std: 3.0,
+            gefs_count: 31,
+            ecmwf_count: 51,
+            ..Default::default()
+        };
+
+        let info = WeatherMarketInfo {
+            city: "NYC".to_string(),
+            date: "2026-02-13".to_string(),
+            bucket_label: "-60-33".to_string(),
+            bucket_lower: -60.0,
+            bucket_upper: 33.0,
+        };
+
+        let prob = get_weather_model_probability(&info, &probs).unwrap();
+        // 0.03 (full [30-32)) + 0.10 * (33-32)/(34-32) = 0.03 + 0.05 = 0.08
+        assert!(
+            (prob - 0.08).abs() < 0.001,
+            "Expected ~0.08, got {}",
+            prob
+        );
+    }
+
+    #[test]
+    fn test_get_weather_model_probability_above_boundary() {
+        // "78°F or above" with 2°F buckets: [76-78)=10%, [78-80)=20%, [80-82)=5%
+        // 78 is exactly at lower bound of [78-80), so [78-80) is fully included.
+        // [76-78) has upper=78 = boundary, so (78-78)/(78-76)=0, excluded.
+        let probs = WeatherProbabilities {
+            city: "MIA".to_string(),
+            station_icao: "KMIA".to_string(),
+            forecast_date: "2026-02-13".to_string(),
+            buckets: vec![
+                BucketProbability {
+                    bucket_label: "76-78".to_string(),
+                    lower: 76.0,
+                    upper: 78.0,
+                    probability: 0.10,
+                },
+                BucketProbability {
+                    bucket_label: "78-80".to_string(),
+                    lower: 78.0,
+                    upper: 80.0,
+                    probability: 0.20,
+                },
+                BucketProbability {
+                    bucket_label: "80-82".to_string(),
+                    lower: 80.0,
+                    upper: 82.0,
+                    probability: 0.05,
+                },
+            ],
+            ensemble_mean: 77.0,
+            ensemble_std: 2.0,
+            gefs_count: 31,
+            ecmwf_count: 51,
+            ..Default::default()
+        };
+
+        let info = WeatherMarketInfo {
+            city: "MIA".to_string(),
+            date: "2026-02-13".to_string(),
+            bucket_label: "78-130".to_string(),
+            bucket_lower: 78.0,
+            bucket_upper: 130.0,
+        };
+
+        let prob = get_weather_model_probability(&info, &probs).unwrap();
+        // [78-80) fully included (0.20) + [80-82) fully included (0.05) = 0.25
+        assert!(
+            (prob - 0.25).abs() < 0.001,
+            "Expected ~0.25, got {}",
+            prob
+        );
+    }
+
+    #[test]
+    fn test_get_weather_model_probability_above_odd_boundary() {
+        // "79°F or above" — 79 falls inside [78-80)
+        // [78-80): overlap = (80-79)/(80-78) = 0.5 → 0.20 * 0.5 = 0.10
+        // [80-82): fully included → 0.05
+        // Total = 0.15
+        let probs = WeatherProbabilities {
+            city: "MIA".to_string(),
+            station_icao: "KMIA".to_string(),
+            forecast_date: "2026-02-13".to_string(),
+            buckets: vec![
+                BucketProbability {
+                    bucket_label: "76-78".to_string(),
+                    lower: 76.0,
+                    upper: 78.0,
+                    probability: 0.10,
+                },
+                BucketProbability {
+                    bucket_label: "78-80".to_string(),
+                    lower: 78.0,
+                    upper: 80.0,
+                    probability: 0.20,
+                },
+                BucketProbability {
+                    bucket_label: "80-82".to_string(),
+                    lower: 80.0,
+                    upper: 82.0,
+                    probability: 0.05,
+                },
+            ],
+            ensemble_mean: 77.0,
+            ensemble_std: 2.0,
+            gefs_count: 31,
+            ecmwf_count: 51,
+            ..Default::default()
+        };
+
+        let info = WeatherMarketInfo {
+            city: "MIA".to_string(),
+            date: "2026-02-13".to_string(),
+            bucket_label: "79-130".to_string(),
+            bucket_lower: 79.0,
+            bucket_upper: 130.0,
+        };
+
+        let prob = get_weather_model_probability(&info, &probs).unwrap();
+        assert!(
+            (prob - 0.15).abs() < 0.001,
+            "Expected ~0.15, got {}",
+            prob
+        );
     }
 
     #[test]

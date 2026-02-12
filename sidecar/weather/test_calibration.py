@@ -1,8 +1,9 @@
-"""Tests for calibration module."""
+"""Tests for calibration module and probability model."""
 
 import os
 import sqlite3
 import tempfile
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -12,6 +13,7 @@ from weather.calibration import (
     load_calibration,
     save_calibration,
 )
+from weather.probability_model import compute_bucket_probabilities
 
 
 def _create_test_db(
@@ -426,3 +428,93 @@ def test_backfill_organic_source_preserved():
 
     conn.close()
     os.unlink(path)
+
+
+# --- Probability model tests: wu_actual floor clamping ---
+
+
+@dataclass
+class _FakeEnsembleForecast:
+    """Minimal mock for EnsembleForecast used by compute_bucket_probabilities."""
+    city: str = "ATL"
+    station_icao: str = "KATL"
+    forecast_date: str = "2026-02-12"
+    gefs_daily_max: list = field(default_factory=list)
+    ecmwf_daily_max: list = field(default_factory=list)
+    icon_daily_max: list = field(default_factory=list)
+    gem_daily_max: list = field(default_factory=list)
+    all_members: list = field(default_factory=list)
+
+
+def test_wu_actual_floor_zeros_impossible_buckets():
+    """When wu_actual=64, all buckets below 64°F should have ~0% probability."""
+    # Simulate ensemble members centered around 60°F (some below 64)
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(60.0, 4.0, size=100))
+
+    forecast = _FakeEnsembleForecast(
+        gefs_daily_max=members[:31],
+        ecmwf_daily_max=members[31:82],
+        all_members=members,
+    )
+
+    # Without floor: should have probability mass below 64
+    probs_no_floor = compute_bucket_probabilities(forecast, bucket_range=(50, 80))
+    below_64_no_floor = sum(
+        b.probability for b in probs_no_floor.buckets if b.upper <= 64
+    )
+    assert below_64_no_floor > 0.1, (
+        f"Without floor, expected >10% below 64°F, got {below_64_no_floor:.1%}"
+    )
+
+    # With floor at 64: nothing below 64 should survive
+    probs_with_floor = compute_bucket_probabilities(
+        forecast, bucket_range=(50, 80), wu_actual=64.0
+    )
+    below_64_with_floor = sum(
+        b.probability for b in probs_with_floor.buckets if b.upper <= 64
+    )
+    assert below_64_with_floor < 0.01, (
+        f"With wu_actual=64, expected <1% below 64°F, got {below_64_with_floor:.1%}"
+    )
+    assert probs_with_floor.wu_actual_floor == 64.0
+
+
+def test_wu_actual_floor_preserves_above_buckets():
+    """Floor should not eliminate probability mass above the actual."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(70.0, 3.0, size=100))
+
+    forecast = _FakeEnsembleForecast(
+        gefs_daily_max=members[:31],
+        ecmwf_daily_max=members[31:82],
+        all_members=members,
+    )
+
+    probs = compute_bucket_probabilities(
+        forecast, bucket_range=(50, 90), wu_actual=65.0
+    )
+    above_65 = sum(b.probability for b in probs.buckets if b.lower >= 66)
+    # Most mass should still be above the floor (mean is 70)
+    assert above_65 > 0.5, (
+        f"Expected >50% above 66°F with mean=70, got {above_65:.1%}"
+    )
+    total = sum(b.probability for b in probs.buckets)
+    assert abs(total - 1.0) < 0.01, f"Total probability should be ~1.0, got {total}"
+
+
+def test_wu_actual_floor_none_is_noop():
+    """When wu_actual is None (not same-day), behavior should be unchanged."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(60.0, 4.0, size=100))
+
+    forecast = _FakeEnsembleForecast(
+        gefs_daily_max=members[:31],
+        ecmwf_daily_max=members[31:82],
+        all_members=members,
+    )
+
+    probs = compute_bucket_probabilities(forecast, bucket_range=(50, 80), wu_actual=None)
+    assert probs.wu_actual_floor is None
+    below_60 = sum(b.probability for b in probs.buckets if b.upper <= 60)
+    assert below_60 > 0.05, "Without floor, should have mass below mean"

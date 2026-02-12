@@ -288,9 +288,27 @@ impl Estimator {
             return Ok(None);
         }
 
-        let (estimate, analysis_cost) = self.analyze(market, prices, weather).await?;
+        let (mut estimate, analysis_cost) = self.analyze(market, prices, weather).await?;
         total_cost += analysis_cost.cost_usd;
         api_calls.push(analysis_cost);
+
+        // For weather markets: clamp Claude's estimate to model_prob ± 0.10
+        // The ensemble KDE is far more reliable than an LLM for weather probability.
+        if let Some(model_prob) = weather.and_then(|w| w.model_probability) {
+            let clamped = estimate.probability.clamp(
+                (model_prob - 0.10).max(0.0),
+                (model_prob + 0.10).min(1.0),
+            );
+            if (clamped - estimate.probability).abs() > 0.001 {
+                warn!(
+                    "Weather clamp: Claude={:.1}% → clamped={:.1}% (model={:.1}%)",
+                    estimate.probability * 100.0,
+                    clamped * 100.0,
+                    model_prob * 100.0,
+                );
+            }
+            estimate.probability = clamped;
+        }
 
         Ok(Some(AnalysisResult {
             market_id: market.condition_id.clone().unwrap_or_default(),
@@ -402,6 +420,11 @@ impl Estimator {
                 "- **Model probability for this outcome:** {:.1}%\n",
                 mp * 100.0
             ));
+            block.push_str(
+                "  *(This is the pre-computed cumulative probability from 143 ensemble members \
+                 after bias correction. Treat this as your primary estimate. Adjust by at most \
+                 ±5 percentage points for qualitative factors not captured by the model.)*\n",
+            );
         }
         block
     }
@@ -893,5 +916,153 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    // 12. test_weather_clamp_high_override
+    #[tokio::test]
+    async fn test_weather_clamp_high_override() {
+        use crate::weather_client::{BucketProbability as WBucket, WeatherProbabilities as WProbs};
+
+        let server = MockServer::start().await;
+
+        // Triage returns YES
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_anthropic_response(
+                    "YES. Weather market worth analyzing.",
+                )),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Analysis returns probability=0.20 (Claude overestimates)
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_anthropic_response(
+                r#"{"probability": 0.20, "confidence": 0.70, "reasoning": "I think 33F is likely", "data_quality": "high"}"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let estimator = Estimator::with_client(
+            Client::new(),
+            server.uri(),
+            "test-key".to_string(),
+            test_template(),
+        );
+        let market = sample_market();
+        let prices = sample_prices();
+
+        let weather_probs = WProbs {
+            city: "NYC".to_string(),
+            station_icao: "KLGA".to_string(),
+            forecast_date: "2026-02-13".to_string(),
+            buckets: vec![WBucket {
+                bucket_label: "32-34".to_string(),
+                lower: 32.0,
+                upper: 34.0,
+                probability: 0.05,
+            }],
+            ensemble_mean: 37.3,
+            ensemble_std: 3.0,
+            gefs_count: 31,
+            ecmwf_count: 51,
+            ..Default::default()
+        };
+        let wx = WeatherContext {
+            probs: &weather_probs,
+            model_probability: Some(0.05), // model says 5%
+        };
+
+        let result = estimator
+            .evaluate(&market, &prices, 0.0, 1.0, Some(&wx))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Claude said 20%, model says 5%, should be clamped to 15% (model + 10pp)
+        assert!(
+            (result.estimate.probability - 0.15).abs() < 0.001,
+            "Expected clamped to 0.15, got {}",
+            result.estimate.probability
+        );
+    }
+
+    // 13. test_weather_clamp_within_range_no_change
+    #[tokio::test]
+    async fn test_weather_clamp_within_range_no_change() {
+        use crate::weather_client::{BucketProbability as WBucket, WeatherProbabilities as WProbs};
+
+        let server = MockServer::start().await;
+
+        // Triage returns YES
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(mock_anthropic_response(
+                    "YES. Weather market worth analyzing.",
+                )),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Analysis returns probability=0.40 (within ±10pp of model 0.35)
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_anthropic_response(
+                r#"{"probability": 0.40, "confidence": 0.80, "reasoning": "Close to model", "data_quality": "high"}"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let estimator = Estimator::with_client(
+            Client::new(),
+            server.uri(),
+            "test-key".to_string(),
+            test_template(),
+        );
+        let market = sample_market();
+        let prices = sample_prices();
+
+        let weather_probs = WProbs {
+            city: "NYC".to_string(),
+            station_icao: "KLGA".to_string(),
+            forecast_date: "2026-02-20".to_string(),
+            buckets: vec![WBucket {
+                bucket_label: "74-76".to_string(),
+                lower: 74.0,
+                upper: 76.0,
+                probability: 0.35,
+            }],
+            ensemble_mean: 75.8,
+            ensemble_std: 2.3,
+            gefs_count: 31,
+            ecmwf_count: 51,
+            ..Default::default()
+        };
+        let wx = WeatherContext {
+            probs: &weather_probs,
+            model_probability: Some(0.35), // model says 35%
+        };
+
+        let result = estimator
+            .evaluate(&market, &prices, 0.0, 1.0, Some(&wx))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Claude said 40%, model says 35%, within ±10pp — no clamping
+        assert!(
+            (result.estimate.probability - 0.40).abs() < 0.001,
+            "Expected unchanged 0.40, got {}",
+            result.estimate.probability
+        );
     }
 }

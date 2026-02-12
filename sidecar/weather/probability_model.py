@@ -42,6 +42,7 @@ class WeatherProbabilities:
     calibration_spread: Optional[float] = None
     wu_forecast_high: Optional[float] = None
     wu_forecast_shift: float = 0.0
+    wu_actual_floor: Optional[float] = None
 
 
 def compute_bucket_probabilities(
@@ -57,6 +58,7 @@ def compute_bucket_probabilities(
     calibration_spread: Optional[float] = None,
     wu_forecast_high: Optional[float] = None,
     wu_forecast_weight: float = 0.5,
+    wu_actual: Optional[float] = None,
 ) -> WeatherProbabilities:
     """Convert ensemble member temperatures to bucket probabilities using Gaussian KDE."""
     members = np.array(forecast.all_members, dtype=np.float64)
@@ -115,6 +117,16 @@ def compute_bucket_probabilities(
     else:
         corrected = members
 
+    # Same-day floor: clamp all members to at least the observed WU actual high.
+    # Applied AFTER spread correction so it can't be undone by spread expansion.
+    # The daily high can only go up from here, so no ensemble member should be below it.
+    if wu_actual is not None:
+        corrected = np.maximum(corrected, wu_actual)
+        mean = float(np.mean(corrected))
+        std = float(np.std(corrected)) if len(corrected) > 1 else 0.0
+        logger.info("Same-day floor: clamped %d members to >= %.1f°F (wu_actual)",
+                     len(corrected), wu_actual)
+
     # Build buckets
     buckets: list[BucketProbability] = []
     lower = bucket_range[0]
@@ -152,6 +164,17 @@ def compute_bucket_probabilities(
     else:
         _histogram_fallback(corrected, buckets)
 
+    # Same-day floor: zero out buckets entirely below the observed actual and renormalize.
+    # KDE kernel tails can leak probability below the floor even after member clamping.
+    if wu_actual is not None:
+        for bucket in buckets:
+            if bucket.upper <= wu_actual:
+                bucket.probability = 0.0
+        floor_total = sum(b.probability for b in buckets)
+        if floor_total > 0:
+            for bucket in buckets:
+                bucket.probability /= floor_total
+
     # Filter to only buckets with non-negligible probability
     significant_buckets = [b for b in buckets if b.probability > 1e-6]
 
@@ -180,6 +203,7 @@ def compute_bucket_probabilities(
         calibration_spread=calibration_spread,
         wu_forecast_high=wu_forecast_high,
         wu_forecast_shift=wu_fcst_shift,
+        wu_actual_floor=wu_actual,
     )
 
 

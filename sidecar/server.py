@@ -157,6 +157,7 @@ class WeatherResponse(BaseModel):
     wu_high: float | None = None
     wu_forecast_high: float | None = None
     wu_forecast_shift: float = 0.0
+    wu_actual_floor: float | None = None
 
 
 class WUActualResponse(BaseModel):
@@ -305,6 +306,7 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
         calibration_spread=cal_spread,
         wu_forecast_high=wu_forecast_high,
         wu_forecast_weight=WEATHER_WU_FORECAST_WEIGHT,
+        wu_actual=wu_high if same_day else None,
     )
 
     # Try NBM blending (optional — graceful degradation if herbie not installed)
@@ -362,6 +364,7 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
         wu_high=wu_high,
         wu_forecast_high=probs.wu_forecast_high,
         wu_forecast_shift=probs.wu_forecast_shift,
+        wu_actual_floor=probs.wu_actual_floor,
     )
 
 
