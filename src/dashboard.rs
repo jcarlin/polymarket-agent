@@ -33,6 +33,7 @@ struct StatusResponse {
     total_trades: i64,
     next_cycle: i64,
     api_cost_24h: f64,
+    total_trading_fees: f64,
 }
 
 #[derive(Serialize)]
@@ -57,6 +58,11 @@ struct TradeResponse {
     status: String,
     paper: bool,
     created_at: String,
+    question: Option<String>,
+    realized_pnl: Option<f64>,
+    unrealized_pnl: Option<f64>,
+    position_status: Option<String>,
+    entry_fee: f64,
 }
 
 #[derive(Serialize)]
@@ -105,6 +111,7 @@ struct OpportunityResponse {
     status: String,
     reject_reason: Option<String>,
     cycle_number: i64,
+    created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +134,7 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
     let total_trades = db.get_total_trades_count().unwrap_or(0);
     let next_cycle = db.get_next_cycle_number().unwrap_or(1);
     let api_cost_24h = db.get_api_cost_since(24).unwrap_or(0.0);
+    let total_trading_fees = db.get_total_trading_fees();
 
     Json(StatusResponse {
         trading_mode: state.trading_mode.clone(),
@@ -136,6 +144,7 @@ async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
         total_trades,
         next_cycle,
         api_cost_24h,
+        total_trading_fees,
     })
 }
 
@@ -179,6 +188,11 @@ async fn api_trades(
             status: t.status,
             paper: t.paper,
             created_at: t.created_at,
+            question: t.question,
+            realized_pnl: t.realized_pnl,
+            unrealized_pnl: t.unrealized_pnl,
+            position_status: t.position_status,
+            entry_fee: t.entry_fee,
         })
         .collect();
 
@@ -286,6 +300,7 @@ async fn api_opportunities(
             status: o.status,
             reject_reason: o.reject_reason,
             cycle_number: o.cycle_number,
+            created_at: Some(o.created_at),
         })
         .collect();
 
@@ -497,7 +512,7 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            db.insert_trade("t1", "0xtest", "tok1", "YES", 0.60, 5.0, "filled", true)
+            db.insert_trade("t1", "0xtest", "tok1", "YES", 0.60, 5.0, "filled", true, 0.0)
                 .unwrap();
         }
 
@@ -536,6 +551,7 @@ mod tests {
                     1.0,
                     "filled",
                     true,
+                    0.0,
                 )
                 .unwrap();
             }

@@ -36,7 +36,7 @@ fn test_edge_detector_basic() {
     use polymarket_agent::edge_detector::EdgeDetector;
     use polymarket_agent::estimator::{AnalysisResult, FairValueEstimate};
 
-    let detector = EdgeDetector::new(0.08);
+    let detector = EdgeDetector::new(0.08, 0.02);
     let result = AnalysisResult {
         market_id: "0xtest".to_string(),
         question: "Test?".to_string(),
@@ -61,7 +61,7 @@ fn test_position_sizer_kelly_basic() {
     use polymarket_agent::edge_detector::{EdgeOpportunity, TradeSide};
     use polymarket_agent::position_sizer::PositionSizer;
 
-    let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+    let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
     let opp = EdgeOpportunity {
         market_id: "0xtest".to_string(),
         question: "Test?".to_string(),
@@ -69,6 +69,7 @@ fn test_position_sizer_kelly_basic() {
         estimated_probability: 0.75,
         market_price: 0.55,
         edge: 0.20,
+        net_edge: 0.20,
         confidence: 0.85,
         data_quality: "high".to_string(),
         reasoning: "Test".to_string(),
@@ -98,7 +99,7 @@ async fn test_paper_trade_end_to_end() {
         .unwrap();
     db.ensure_bankroll_seeded(50.0).unwrap();
 
-    let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+    let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
     let opp = EdgeOpportunity {
         market_id: "0xe2e".to_string(),
         question: "E2E test?".to_string(),
@@ -106,6 +107,7 @@ async fn test_paper_trade_end_to_end() {
         estimated_probability: 0.75,
         market_price: 0.55,
         edge: 0.20,
+        net_edge: 0.20,
         confidence: 0.85,
         data_quality: "high".to_string(),
         reasoning: "Test".to_string(),
@@ -115,7 +117,7 @@ async fn test_paper_trade_end_to_end() {
     let sizing = sizer.size_position(&opp, 50.0, 0.0);
     assert!(!sizing.is_rejected());
 
-    let executor = Executor::new("http://unused:9999", TradingMode::Paper, 5).unwrap();
+    let executor = Executor::new("http://unused:9999", TradingMode::Paper, 5, 0.0).unwrap();
     let intent = TradeIntent {
         opportunity: opp,
         token_id: "tok_yes_e2e".to_string(),
@@ -285,7 +287,7 @@ async fn test_weather_client_deserialization() {
         .await;
 
     let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
-    let result = client.get_probabilities("CHI", "2026-03-15").await.unwrap();
+    let result = client.get_probabilities("CHI", "2026-03-15", false).await.unwrap();
 
     assert_eq!(result.city, "CHI");
     assert_eq!(result.station_icao, "KORD");
@@ -331,7 +333,7 @@ async fn test_dashboard_status_with_data() {
             [],
         )
         .unwrap();
-    db.insert_trade("dt1", "0xdash", "tok1", "YES", 0.60, 5.0, "filled", true)
+    db.insert_trade("dt1", "0xdash", "tok1", "YES", 0.60, 5.0, "filled", true, 0.0)
         .unwrap();
 
     let state = AppState {
@@ -545,7 +547,7 @@ fn test_stop_loss_end_to_end() {
         question: Some("Stop-loss test?".to_string()),
     };
 
-    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15, 0.25);
+    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15, 0.25, 0.0);
     // Price at 0.50 = 16.7% loss > 15% threshold
     let action = mgr.evaluate_position(&pos, 0.50);
     assert!(matches!(action, PositionAction::Exit { .. }));
@@ -572,10 +574,10 @@ fn test_drawdown_reduces_sizing() {
     assert!(state.is_circuit_breaker_active);
 
     // Normal sizer: kelly_fraction = 0.5
-    let normal_sizer = PositionSizer::new(0.5, 0.06, 0.40);
+    let normal_sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
 
     // Drawdown sizer: kelly_fraction = 0.5 * 0.5 = 0.25
-    let drawdown_sizer = PositionSizer::new(0.25, 0.06, 0.40);
+    let drawdown_sizer = PositionSizer::new(0.25, 0.06, 0.40, 0.0);
 
     let opp = polymarket_agent::edge_detector::EdgeOpportunity {
         market_id: "0xdd".to_string(),
@@ -584,6 +586,7 @@ fn test_drawdown_reduces_sizing() {
         estimated_probability: 0.80,
         market_price: 0.50,
         edge: 0.30,
+        net_edge: 0.30,
         confidence: 0.85,
         data_quality: "high".to_string(),
         reasoning: "Test".to_string(),
@@ -604,7 +607,7 @@ fn test_correlated_exposure_blocks_trade() {
     use polymarket_agent::db::PositionRow;
     use polymarket_agent::position_manager::PositionManager;
 
-    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15, 0.25);
+    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15, 0.25, 0.0);
 
     // Create positions in the Northeast group (NYC + BOS)
     let positions = vec![

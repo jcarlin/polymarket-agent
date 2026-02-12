@@ -6,6 +6,7 @@ pub struct PositionSizer {
     pub kelly_fraction: f64,
     pub max_position_pct: f64,
     pub max_total_exposure_pct: f64,
+    pub fee_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,7 @@ pub struct SizingResult {
     pub position_usd: f64,
     pub shares: f64,
     pub limit_price: f64,
+    pub entry_fee: f64,
     pub reject_reason: Option<String>,
 }
 
@@ -30,17 +32,19 @@ impl SizingResult {
             position_usd: 0.0,
             shares: 0.0,
             limit_price: 0.0,
+            entry_fee: 0.0,
             reject_reason: Some(reason.to_string()),
         }
     }
 }
 
 impl PositionSizer {
-    pub fn new(kelly_fraction: f64, max_position_pct: f64, max_total_exposure_pct: f64) -> Self {
+    pub fn new(kelly_fraction: f64, max_position_pct: f64, max_total_exposure_pct: f64, fee_rate: f64) -> Self {
         PositionSizer {
             kelly_fraction,
             max_position_pct,
             max_total_exposure_pct,
+            fee_rate,
         }
     }
 
@@ -84,8 +88,17 @@ impl PositionSizer {
             return SizingResult::rejected("buy price >= 1.0");
         }
 
-        // Kelly criterion for binary outcome
-        let raw_kelly = (win_prob - buy_price) / (1.0 - buy_price);
+        // Fee-adjusted Kelly criterion for binary outcome
+        // effective_buy = buy_price * (1 + fee_rate) — total cost per share including entry fee
+        // effective_payout = 1.0 - fee_rate — net payout per share after exit fee
+        let effective_buy = buy_price * (1.0 + self.fee_rate);
+        let effective_payout = 1.0 - self.fee_rate;
+
+        if effective_buy >= effective_payout {
+            return SizingResult::rejected("fees eliminate edge");
+        }
+
+        let raw_kelly = (win_prob * effective_payout - effective_buy) / (effective_payout - effective_buy);
 
         if raw_kelly <= 0.0 {
             return SizingResult::rejected("negative Kelly — no edge");
@@ -129,11 +142,13 @@ impl PositionSizer {
             ));
         }
 
-        let shares = position_usd / buy_price;
+        // Shares: account for entry fee in cost basis
+        let shares = position_usd / (buy_price * (1.0 + self.fee_rate));
+        let entry_fee = self.fee_rate * position_usd;
 
         info!(
-            "Sized {} {}: kelly={:.3}, adj={:.3}, ${:.2} ({:.1} shares @ {:.2})",
-            opp.side, opp.question, raw_kelly, adjusted_kelly, position_usd, shares, buy_price,
+            "Sized {} {}: kelly={:.3}, adj={:.3}, ${:.2} ({:.1} shares @ {:.2}, fee=${:.4})",
+            opp.side, opp.question, raw_kelly, adjusted_kelly, position_usd, shares, buy_price, entry_fee,
         );
 
         SizingResult {
@@ -142,6 +157,7 @@ impl PositionSizer {
             position_usd,
             shares,
             limit_price: buy_price,
+            entry_fee,
             reject_reason: None,
         }
     }
@@ -164,6 +180,7 @@ mod tests {
             estimated_probability: estimated_prob,
             market_price,
             edge,
+            net_edge: edge,
             confidence: 0.85,
             data_quality: "high".to_string(),
             reasoning: "Test reasoning".to_string(),
@@ -173,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_positive_edge_yes_side() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         // est=0.75, market=0.55 → buy YES at 0.55
         // kelly = (0.75 - 0.55) / (1 - 0.55) = 0.20 / 0.45 = 0.4444
         // adjusted = 0.4444 * 0.5 = 0.2222
@@ -190,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_positive_edge_no_side() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         // est=0.30, market=0.55 → buy NO at 1-0.55=0.45, win_prob=1-0.30=0.70
         // kelly = (0.70 - 0.45) / (1 - 0.45) = 0.25 / 0.55 = 0.4545
         // adjusted = 0.4545 * 0.5 = 0.2273
@@ -204,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_negative_kelly_rejected() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         // est=0.50, market=0.55 → buy YES at 0.55, win_prob=0.50
         // kelly = (0.50 - 0.55) / (1 - 0.55) = -0.05/0.45 = -0.111 → reject
         let opp = make_opportunity(TradeSide::Yes, 0.50, 0.55, 0.0);
@@ -215,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_half_kelly_applied() {
-        let sizer = PositionSizer::new(0.5, 1.0, 1.0); // no caps for this test
+        let sizer = PositionSizer::new(0.5, 1.0, 1.0, 0.0); // no caps for this test
         let opp = make_opportunity(TradeSide::Yes, 0.80, 0.50, 0.30);
         // kelly = (0.80 - 0.50) / (1 - 0.50) = 0.60
         // adjusted = 0.60 * 0.5 = 0.30
@@ -229,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_position_capped_by_max_pct() {
-        let sizer = PositionSizer::new(1.0, 0.06, 1.0); // full Kelly, 6% cap
+        let sizer = PositionSizer::new(1.0, 0.06, 1.0, 0.0); // full Kelly, 6% cap
                                                         // Large kelly → capped at 6% of bankroll
         let opp = make_opportunity(TradeSide::Yes, 0.95, 0.50, 0.45);
         // kelly = (0.95 - 0.50) / (1 - 0.50) = 0.90
@@ -241,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_exposure_limit_constrains_position() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         // With $50 bankroll, max exposure = 0.40*50 = 20
         // Current exposure = 19.5, remaining = 0.5 → too small
         let opp = make_opportunity(TradeSide::Yes, 0.75, 0.55, 0.20);
@@ -253,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_exposure_limit_partially_constrains() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         // bankroll=50, max_exposure=20, current=18, remaining=2
         // Kelly wants 3.0 but remaining is 2.0
         let opp = make_opportunity(TradeSide::Yes, 0.75, 0.55, 0.20);
@@ -264,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_min_trade_size_rejected() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         // Very small bankroll → position too small
         let opp = make_opportunity(TradeSide::Yes, 0.75, 0.55, 0.20);
         // bankroll=5, max_pos=0.06*5=0.30 < $1.00
@@ -275,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_shares_calculation() {
-        let sizer = PositionSizer::new(0.5, 1.0, 1.0); // no caps
+        let sizer = PositionSizer::new(0.5, 1.0, 1.0, 0.0); // no caps
         let opp = make_opportunity(TradeSide::Yes, 0.80, 0.50, 0.30);
         let result = sizer.size_position(&opp, 100.0, 0.0);
         // position = 30.0, buy_price = 0.50
@@ -285,15 +302,61 @@ mod tests {
 
     #[test]
     fn test_zero_bankroll_rejects() {
-        let sizer = PositionSizer::new(0.5, 0.06, 0.40);
+        let sizer = PositionSizer::new(0.5, 0.06, 0.40, 0.0);
         let opp = make_opportunity(TradeSide::Yes, 0.75, 0.55, 0.20);
         let result = sizer.size_position(&opp, 0.0, 0.0);
         assert!(result.is_rejected());
     }
 
     #[test]
+    fn test_realistic_fees() {
+        let sizer = PositionSizer::new(0.5, 1.0, 1.0, 0.02); // 2% fee
+        // est=0.80, market=0.50 → buy YES at 0.50
+        // effective_buy = 0.50 * 1.02 = 0.51
+        // effective_payout = 1.0 - 0.02 = 0.98
+        // kelly = (0.80 * 0.98 - 0.51) / (0.98 - 0.51)
+        //       = (0.784 - 0.51) / 0.47
+        //       = 0.274 / 0.47 = 0.58298
+        // adjusted = 0.58298 * 0.5 = 0.29149
+        // position = 0.29149 * 100 = 29.149
+        let opp = make_opportunity(TradeSide::Yes, 0.80, 0.50, 0.30);
+        let result = sizer.size_position(&opp, 100.0, 0.0);
+        assert!(!result.is_rejected());
+
+        let effective_buy = 0.50 * 1.02;
+        let effective_payout = 0.98;
+        let expected_kelly = (0.80 * effective_payout - effective_buy) / (effective_payout - effective_buy);
+        assert!((result.raw_kelly - expected_kelly).abs() < 1e-6);
+        assert!((result.adjusted_kelly - expected_kelly * 0.5).abs() < 1e-6);
+
+        // shares = position_usd / (buy_price * (1 + fee_rate))
+        let expected_shares = result.position_usd / (0.50 * 1.02);
+        assert!((result.shares - expected_shares).abs() < 1e-6);
+
+        // entry_fee = fee_rate * position_usd
+        let expected_fee = 0.02 * result.position_usd;
+        assert!((result.entry_fee - expected_fee).abs() < 1e-6);
+
+        // Position should be smaller than zero-fee case ($30.0) due to fees
+        assert!(result.position_usd < 30.0);
+    }
+
+    #[test]
+    fn test_fees_eliminate_edge() {
+        // High fee rate that eliminates the edge entirely
+        let sizer = PositionSizer::new(0.5, 1.0, 1.0, 0.30); // 30% fee
+        // buy YES at 0.80, effective_buy = 0.80 * 1.30 = 1.04
+        // effective_payout = 1.0 - 0.30 = 0.70
+        // effective_buy >= effective_payout → rejected
+        let opp = make_opportunity(TradeSide::Yes, 0.90, 0.80, 0.10);
+        let result = sizer.size_position(&opp, 100.0, 0.0);
+        assert!(result.is_rejected());
+        assert!(result.reject_reason.unwrap().contains("fees eliminate edge"));
+    }
+
+    #[test]
     fn test_time_based_sizing() {
-        let sizer = PositionSizer::new(0.5, 1.0, 1.0); // no caps for clarity
+        let sizer = PositionSizer::new(0.5, 1.0, 1.0, 0.0); // no caps for clarity
         let opp = make_opportunity(TradeSide::Yes, 0.80, 0.50, 0.30);
         // kelly = (0.80 - 0.50) / (1 - 0.50) = 0.60, adjusted = 0.30
         // position = 0.30 * 100 = 30.0

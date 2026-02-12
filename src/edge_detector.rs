@@ -26,6 +26,7 @@ pub struct EdgeOpportunity {
     pub estimated_probability: f64,
     pub market_price: f64,
     pub edge: f64,
+    pub net_edge: f64,
     pub confidence: f64,
     pub data_quality: String,
     pub reasoning: String,
@@ -35,13 +36,15 @@ pub struct EdgeOpportunity {
 pub struct EdgeDetector {
     pub min_edge_threshold: f64,
     pub min_confidence: f64,
+    pub fee_rate: f64,
 }
 
 impl EdgeDetector {
-    pub fn new(min_edge_threshold: f64) -> Self {
+    pub fn new(min_edge_threshold: f64, fee_rate: f64) -> Self {
         EdgeDetector {
             min_edge_threshold,
             min_confidence: 0.50,
+            fee_rate,
         }
     }
 
@@ -58,13 +61,17 @@ impl EdgeDetector {
             (TradeSide::No, no_edge)
         };
 
-        if edge < self.min_edge_threshold {
+        // Subtract round-trip fees from edge
+        let net_edge = edge - 2.0 * self.fee_rate;
+
+        if net_edge < self.min_edge_threshold {
             info!(
-                "No edge on '{}': est={:.2}, mkt={:.2}, edge={:.1}% < {:.1}%",
+                "No edge on '{}': est={:.2}, mkt={:.2}, edge={:.1}%, net_edge={:.1}% < {:.1}%",
                 analysis.question,
                 estimated_yes,
                 market_yes,
                 edge * 100.0,
+                net_edge * 100.0,
                 self.min_edge_threshold * 100.0,
             );
             return None;
@@ -79,12 +86,13 @@ impl EdgeDetector {
         }
 
         info!(
-            "EDGE FOUND on '{}': {} side, est={:.2}, mkt={:.2}, edge={:.1}%, conf={:.2}",
+            "EDGE FOUND on '{}': {} side, est={:.2}, mkt={:.2}, edge={:.1}%, net={:.1}%, conf={:.2}",
             analysis.question,
             side,
             estimated_yes,
             market_yes,
             edge * 100.0,
+            net_edge * 100.0,
             analysis.estimate.confidence,
         );
 
@@ -95,6 +103,7 @@ impl EdgeDetector {
             estimated_probability: estimated_yes,
             market_price: market_yes,
             edge,
+            net_edge,
             confidence: analysis.estimate.confidence,
             data_quality: analysis.estimate.data_quality.clone(),
             reasoning: analysis.estimate.reasoning.clone(),
@@ -107,8 +116,8 @@ impl EdgeDetector {
             analyses.iter().filter_map(|a| self.detect(a)).collect();
 
         opportunities.sort_by(|a, b| {
-            b.edge
-                .partial_cmp(&a.edge)
+            b.net_edge
+                .partial_cmp(&a.net_edge)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -145,63 +154,74 @@ mod tests {
 
     #[test]
     fn test_detect_yes_edge_above_threshold() {
-        let detector = EdgeDetector::new(0.08);
+        // fee_rate=0.02 → round-trip = 0.04, net_edge = 0.20 - 0.04 = 0.16
+        let detector = EdgeDetector::new(0.08, 0.02);
         let analysis = make_analysis(0.75, 0.55, 0.85);
         let opp = detector.detect(&analysis).unwrap();
         assert_eq!(opp.side, TradeSide::Yes);
         assert!((opp.edge - 0.20).abs() < 0.001);
+        assert!((opp.net_edge - 0.16).abs() < 0.001);
     }
 
     #[test]
     fn test_detect_no_edge_above_threshold() {
-        let detector = EdgeDetector::new(0.08);
+        let detector = EdgeDetector::new(0.08, 0.02);
         let analysis = make_analysis(0.30, 0.55, 0.85);
         let opp = detector.detect(&analysis).unwrap();
         assert_eq!(opp.side, TradeSide::No);
         assert!((opp.edge - 0.25).abs() < 0.001);
+        assert!((opp.net_edge - 0.21).abs() < 0.001);
     }
 
     #[test]
     fn test_detect_below_threshold() {
-        let detector = EdgeDetector::new(0.08);
+        // edge=0.05, net_edge=0.05-0.04=0.01 < 0.08
+        let detector = EdgeDetector::new(0.08, 0.02);
         let analysis = make_analysis(0.60, 0.55, 0.85);
         assert!(detector.detect(&analysis).is_none());
     }
 
     #[test]
     fn test_detect_low_confidence() {
-        let detector = EdgeDetector::new(0.08);
+        let detector = EdgeDetector::new(0.08, 0.02);
         let analysis = make_analysis(0.75, 0.55, 0.30);
         assert!(detector.detect(&analysis).is_none());
     }
 
     #[test]
     fn test_detect_edge_at_exact_threshold() {
-        let detector = EdgeDetector::new(0.08);
-        // Use 0.68 - 0.60 = 0.08 exactly (avoids f64 rounding with 0.63 - 0.55)
+        // With fee_rate=0.0: edge=0.08 exactly → net_edge=0.08 >= 0.08
+        let detector = EdgeDetector::new(0.08, 0.0);
         let analysis = make_analysis(0.68, 0.60, 0.85);
         let opp = detector.detect(&analysis);
-        assert!(opp.is_some()); // edge 0.08 >= threshold 0.08
+        assert!(opp.is_some());
     }
 
     #[test]
-    fn test_detect_batch_sorts_by_edge() {
-        let detector = EdgeDetector::new(0.08);
+    fn test_fees_can_eliminate_edge() {
+        // edge=0.10, fee_rate=0.05 → net_edge=0.10-0.10=0.00 < 0.08
+        let detector = EdgeDetector::new(0.08, 0.05);
+        let analysis = make_analysis(0.65, 0.55, 0.85);
+        assert!(detector.detect(&analysis).is_none());
+    }
+
+    #[test]
+    fn test_detect_batch_sorts_by_net_edge() {
+        let detector = EdgeDetector::new(0.08, 0.02);
         let analyses = vec![
-            make_analysis(0.65, 0.55, 0.85), // edge 0.10
-            make_analysis(0.80, 0.55, 0.85), // edge 0.25
-            make_analysis(0.70, 0.55, 0.85), // edge 0.15
+            make_analysis(0.65, 0.55, 0.85), // edge 0.10, net 0.06 → rejected (< 0.08)
+            make_analysis(0.80, 0.55, 0.85), // edge 0.25, net 0.21
+            make_analysis(0.70, 0.55, 0.85), // edge 0.15, net 0.11
         ];
         let opps = detector.detect_batch(&analyses);
-        assert_eq!(opps.len(), 3);
-        assert!((opps[0].edge - 0.25).abs() < 0.001);
-        assert!((opps[1].edge - 0.15).abs() < 0.001);
-        assert!((opps[2].edge - 0.10).abs() < 0.001);
+        assert_eq!(opps.len(), 2); // first one rejected due to net_edge < threshold
+        assert!((opps[0].net_edge - 0.21).abs() < 0.001);
+        assert!((opps[1].net_edge - 0.11).abs() < 0.001);
     }
 
     #[test]
     fn test_detect_batch_empty() {
-        let detector = EdgeDetector::new(0.08);
+        let detector = EdgeDetector::new(0.08, 0.02);
         let opps = detector.detect_batch(&[]);
         assert!(opps.is_empty());
     }

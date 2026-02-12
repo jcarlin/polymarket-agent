@@ -1,4 +1,4 @@
-"""Tests for Weather Underground scraper."""
+"""Tests for Weather Underground API-based temperature fetcher."""
 
 from unittest.mock import AsyncMock
 
@@ -6,10 +6,11 @@ import httpx
 import pytest
 
 from weather.wu_scraper import (
-    _parse_wu_html,
+    _extract_daily_high,
     _wu_cache,
     fetch_wu_actual,
     icao_to_wu_path,
+    _build_api_url,
 )
 
 
@@ -50,41 +51,61 @@ def test_icao_to_wu_path_unknown():
     assert icao_to_wu_path("KJFK") is None
 
 
-def test_parse_wu_html():
-    """Should extract temperature from WU HTML containing Max Temperature."""
-    html = """
-    <div class="observation-table">
-        <table>
-            <tr><td>Max Temperature</td><td>75&deg;F</td></tr>
-            <tr><td>Min Temperature</td><td>55&deg;F</td></tr>
-        </table>
-    </div>
-    """
-    assert _parse_wu_html(html) == 75.0
+def test_build_api_url():
+    """API URL should use compact date format and correct station."""
+    url = _build_api_url("KLGA", "2026-02-11")
+    assert "KLGA:9:US" in url
+    assert "startDate=20260211" in url
+    assert "endDate=20260211" in url
+    assert "units=e" in url
 
 
-def test_parse_wu_html_degree_symbol():
-    """Should handle the actual degree symbol."""
-    html = '<span>Maximum Temperature</span><span>82\u00b0F</span>'
-    assert _parse_wu_html(html) == 82.0
+def test_extract_daily_high():
+    """Should return max temp from hourly observations."""
+    data = {
+        "observations": [
+            {"temp": 32, "valid_time_gmt": 1000},
+            {"temp": 35, "valid_time_gmt": 2000},
+            {"temp": 41, "valid_time_gmt": 3000},  # daily high
+            {"temp": 38, "valid_time_gmt": 4000},
+            {"temp": 33, "valid_time_gmt": 5000},
+        ]
+    }
+    assert _extract_daily_high(data) == 41.0
 
 
-def test_parse_wu_html_fallback():
-    """Should use fallback pattern for maxTempValue."""
-    html = '<span class="maxTempValue">91</span>'
-    assert _parse_wu_html(html) == 91.0
+def test_extract_daily_high_with_nulls():
+    """Should skip observations with null temps."""
+    data = {
+        "observations": [
+            {"temp": 32, "valid_time_gmt": 1000},
+            {"temp": None, "valid_time_gmt": 2000},
+            {"temp": 45, "valid_time_gmt": 3000},
+        ]
+    }
+    assert _extract_daily_high(data) == 45.0
 
 
-def test_parse_wu_html_no_match():
-    """Should return None if no temperature pattern found."""
-    html = "<html><body>No weather data here</body></html>"
-    assert _parse_wu_html(html) is None
+def test_extract_daily_high_empty():
+    """Should return None for empty observations."""
+    assert _extract_daily_high({"observations": []}) is None
+    assert _extract_daily_high({}) is None
+
+
+def test_extract_daily_high_all_null():
+    """Should return None if all temps are null."""
+    data = {
+        "observations": [
+            {"temp": None},
+            {"temp": None},
+        ]
+    }
+    assert _extract_daily_high(data) is None
 
 
 @pytest.mark.asyncio
 async def test_fetch_wu_actual_unknown_icao():
     """Unknown ICAO should return None without making HTTP request."""
-    # Clear cache to avoid interference
     _wu_cache.clear()
     result = await fetch_wu_actual("ZZZZ", "2026-01-15")
     assert result is None
@@ -105,13 +126,49 @@ async def test_fetch_wu_actual_returns_none_on_failure():
 
 
 @pytest.mark.asyncio
+async def test_fetch_wu_actual_success():
+    """Should extract daily high from API JSON response."""
+    _wu_cache.clear()
+
+    api_response = {
+        "metadata": {"status_code": 200},
+        "observations": [
+            {"temp": 32, "valid_time_gmt": 1000},
+            {"temp": 41, "valid_time_gmt": 2000},
+            {"temp": 38, "valid_time_gmt": 3000},
+        ]
+    }
+
+    mock_response = AsyncMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: api_response
+    mock_response.raise_for_status = lambda: None
+
+    mock_client = AsyncMock(spec=httpx.AsyncClient)
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.aclose = AsyncMock()
+
+    result = await fetch_wu_actual("KLGA", "2026-01-15", client=mock_client)
+    assert result == 41.0
+
+    _wu_cache.clear()
+
+
+@pytest.mark.asyncio
 async def test_fetch_wu_actual_caches_result():
     """Subsequent calls with the same args should use cache."""
     _wu_cache.clear()
 
+    api_response = {
+        "metadata": {"status_code": 200},
+        "observations": [
+            {"temp": 68, "valid_time_gmt": 1000},
+        ]
+    }
+
     mock_response = AsyncMock()
     mock_response.status_code = 200
-    mock_response.text = '<td>Max Temperature</td><td>68&deg;F</td>'
+    mock_response.json = lambda: api_response
     mock_response.raise_for_status = lambda: None
 
     mock_client = AsyncMock(spec=httpx.AsyncClient)

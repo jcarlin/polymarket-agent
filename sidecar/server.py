@@ -17,10 +17,26 @@ SIDECAR_PORT = int(os.getenv("SIDECAR_PORT", "9090"))
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 WEATHER_SPREAD_CORRECTION = float(os.getenv("WEATHER_SPREAD_CORRECTION", "1.3"))
 WEATHER_NBM_WEIGHT = float(os.getenv("WEATHER_NBM_WEIGHT", "0.6"))
+WEATHER_NWS_WEIGHT = float(os.getenv("WEATHER_NWS_WEIGHT", "0.6"))
 WEATHER_HRRR_WEIGHT = float(os.getenv("WEATHER_HRRR_WEIGHT", "0.3"))
+WEATHER_DEFAULT_BIAS_OFFSET = float(os.getenv("WEATHER_DEFAULT_BIAS_OFFSET", "0.0"))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "data/polymarket-agent.db")
 
 # Global client instance — initialized at startup
 polymarket = PolymarketClient()
+
+# Global calibration params — loaded at startup, refreshed on /weather/calibrate
+_calibration_params: dict = {}
+
+
+def _load_calibration_params() -> dict:
+    """Load calibration params from file, returning empty dict on failure."""
+    try:
+        from weather.calibration import load_calibration
+        return load_calibration("calibration_params.json")
+    except Exception as e:
+        logger.debug("No calibration params loaded: %s", e)
+        return {}
 
 
 class HealthResponse(BaseModel):
@@ -46,6 +62,7 @@ class OrderResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _calibration_params
     logger.info("Sidecar starting on port %d in %s mode", SIDECAR_PORT, TRADING_MODE)
     if TRADING_MODE == "live":
         if polymarket.initialize():
@@ -54,6 +71,11 @@ async def lifespan(app: FastAPI):
             logger.warning("Polymarket client failed to initialize — /order will return 503")
     else:
         logger.info("Paper mode — Polymarket client not initialized")
+    _calibration_params = _load_calibration_params()
+    if _calibration_params:
+        logger.info("Loaded calibration for %d cities", len(_calibration_params))
+    if WEATHER_DEFAULT_BIAS_OFFSET != 0.0:
+        logger.info("Default weather bias offset: +%.1f°F", WEATHER_DEFAULT_BIAS_OFFSET)
     yield
     logger.info("Sidecar shutting down")
 
@@ -121,6 +143,9 @@ class WeatherResponse(BaseModel):
     hrrr_max_temp: float | None = None
     hrrr_shift: float = 0.0
     nbm_max_temp: float | None = None
+    calibration_bias: float | None = None
+    calibration_spread: float | None = None
+    wu_high: float | None = None
 
 
 class WUActualResponse(BaseModel):
@@ -210,12 +235,39 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
         except Exception as e:
             logger.warning("HRRR fetch failed for %s/%s: %s", city, date, e)
 
+    # Fetch WU observations (same-day: partial, past: full, future: None)
+    wu_high = None
+    try:
+        from weather.wu_scraper import fetch_wu_actual
+        config = CITY_CONFIGS[city]
+        wu_high = await fetch_wu_actual(config.icao, date)
+    except ImportError:
+        logger.debug("WU scraper not available")
+    except Exception as e:
+        logger.debug("WU fetch for %s/%s: %s", city, date, e)
+
+    # Determine calibration bias: per-city from calibration data, else default
+    cal_bias = None
+    cal_spread = None
+    if city in _calibration_params:
+        cal = _calibration_params[city]
+        cal_bias = cal.bias_offset
+        cal_spread = cal.spread_factor
+        logger.info("Using calibration for %s: bias=%.2f, spread=%.2f (n=%d)",
+                     city, cal_bias, cal_spread, cal.sample_size)
+    elif WEATHER_DEFAULT_BIAS_OFFSET != 0.0:
+        cal_bias = WEATHER_DEFAULT_BIAS_OFFSET
+        logger.info("Using default bias offset for %s: +%.1f°F", city, cal_bias)
+
     probs = compute_bucket_probabilities(
         forecast,
         spread_correction=WEATHER_SPREAD_CORRECTION,
         nws_high=nws_high,
+        nws_weight=WEATHER_NWS_WEIGHT,
         hrrr_max=hrrr_max,
         hrrr_weight=WEATHER_HRRR_WEIGHT,
+        calibration_bias=cal_bias,
+        calibration_spread=cal_spread,
     )
 
     # Try NBM blending (optional — graceful degradation if herbie not installed)
@@ -268,6 +320,9 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
         hrrr_max_temp=probs.hrrr_max_temp,
         hrrr_shift=probs.hrrr_shift,
         nbm_max_temp=nbm_max_temp,
+        calibration_bias=probs.calibration_bias,
+        calibration_spread=probs.calibration_spread,
+        wu_high=wu_high,
     )
 
 
@@ -424,12 +479,14 @@ async def weather_calibration():
 
 
 @app.post("/weather/calibrate")
-async def weather_calibrate(db_path: str = "data/polymarket-agent.db"):
+async def weather_calibrate(db_path: str = DATABASE_PATH):
+    global _calibration_params
     try:
         from weather.calibration import compute_calibration, save_calibration
 
         params = compute_calibration(db_path)
         save_calibration(params, "calibration_params.json")
+        _calibration_params = params  # Refresh in-memory params
         return {
             "status": "ok",
             "cities_calibrated": len(params),
@@ -447,6 +504,145 @@ async def weather_calibrate(db_path: str = "data/polymarket-agent.db"):
     except Exception as e:
         logger.error("Calibration failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class CollectActualRequest(BaseModel):
+    city: str
+    date: str
+    ensemble_mean: float | None = None
+    nws_forecast_high: float | None = None
+
+
+class CollectActualResponse(BaseModel):
+    city: str
+    date: str
+    station_icao: str
+    wu_actual_high: float | None = None
+    stored: bool = False
+
+
+@app.post("/weather/collect_actual", response_model=CollectActualResponse)
+async def collect_actual(req: CollectActualRequest) -> CollectActualResponse:
+    """Fetch WU actual for a city/date and store in weather_actuals table."""
+    _validate_city(req.city)
+    _validate_date(req.date)
+
+    config = CITY_CONFIGS[req.city]
+    wu_high = None
+    try:
+        from weather.wu_scraper import fetch_wu_actual
+        wu_high = await fetch_wu_actual(config.icao, req.date)
+    except ImportError:
+        raise HTTPException(status_code=501, detail="WU scraper not available")
+    except Exception as e:
+        logger.warning("WU fetch failed for %s/%s: %s", req.city, req.date, e)
+
+    stored = False
+    if wu_high is not None:
+        try:
+            import sqlite3
+            conn = sqlite3.connect(DATABASE_PATH)
+            actual_bucket = _temp_to_bucket_label(wu_high)
+            predicted_bucket = _temp_to_bucket_label(req.ensemble_mean) if req.ensemble_mean else None
+            prediction_error = (req.ensemble_mean - wu_high) if req.ensemble_mean else None
+            conn.execute(
+                """INSERT INTO weather_actuals (city, forecast_date, wu_actual_high, nws_forecast_high,
+                   ensemble_mean, predicted_bucket, actual_bucket, prediction_error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(city, forecast_date) DO UPDATE SET
+                     wu_actual_high = COALESCE(excluded.wu_actual_high, wu_actual_high),
+                     nws_forecast_high = COALESCE(excluded.nws_forecast_high, nws_forecast_high),
+                     ensemble_mean = COALESCE(excluded.ensemble_mean, ensemble_mean),
+                     predicted_bucket = COALESCE(excluded.predicted_bucket, predicted_bucket),
+                     actual_bucket = COALESCE(excluded.actual_bucket, actual_bucket),
+                     prediction_error = COALESCE(excluded.prediction_error, prediction_error)""",
+                (req.city, req.date, wu_high, req.nws_forecast_high,
+                 req.ensemble_mean, predicted_bucket, actual_bucket, prediction_error),
+            )
+            conn.commit()
+            conn.close()
+            stored = True
+            logger.info("Stored WU actual for %s/%s: %.0f°F", req.city, req.date, wu_high)
+        except Exception as e:
+            logger.error("Failed to store WU actual: %s", e)
+
+    return CollectActualResponse(
+        city=req.city,
+        date=req.date,
+        station_icao=config.icao,
+        wu_actual_high=wu_high,
+        stored=stored,
+    )
+
+
+class CollectBatchResponse(BaseModel):
+    date: str
+    collected: int
+    failed: int
+    results: list[CollectActualResponse]
+
+
+@app.post("/weather/collect_actuals_batch", response_model=CollectBatchResponse)
+async def collect_actuals_batch(date: str | None = None) -> CollectBatchResponse:
+    """Collect WU actuals for all 20 cities for a given date (default: yesterday)."""
+    if date is None:
+        from datetime import timedelta
+        yesterday = datetime.utcnow() - timedelta(days=1)
+        date = yesterday.strftime("%Y-%m-%d")
+    _validate_date(date)
+
+    results = []
+    collected = 0
+    failed = 0
+
+    for city_code in CITY_CONFIGS:
+        config = CITY_CONFIGS[city_code]
+        wu_high = None
+        try:
+            from weather.wu_scraper import fetch_wu_actual
+            wu_high = await fetch_wu_actual(config.icao, date)
+        except Exception as e:
+            logger.warning("Batch WU fetch failed for %s/%s: %s", city_code, date, e)
+
+        stored = False
+        if wu_high is not None:
+            try:
+                import sqlite3
+                conn = sqlite3.connect(DATABASE_PATH)
+                actual_bucket = _temp_to_bucket_label(wu_high)
+                conn.execute(
+                    """INSERT INTO weather_actuals (city, forecast_date, wu_actual_high, actual_bucket)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(city, forecast_date) DO UPDATE SET
+                         wu_actual_high = COALESCE(excluded.wu_actual_high, wu_actual_high),
+                         actual_bucket = COALESCE(excluded.actual_bucket, actual_bucket)""",
+                    (city_code, date, wu_high, actual_bucket),
+                )
+                conn.commit()
+                conn.close()
+                stored = True
+                collected += 1
+            except Exception as e:
+                logger.error("Failed to store batch WU actual for %s: %s", city_code, e)
+                failed += 1
+        else:
+            failed += 1
+
+        results.append(CollectActualResponse(
+            city=city_code,
+            date=date,
+            station_icao=config.icao,
+            wu_actual_high=wu_high,
+            stored=stored,
+        ))
+
+    logger.info("Batch WU collection for %s: %d collected, %d failed", date, collected, failed)
+    return CollectBatchResponse(
+        date=date,
+        collected=collected,
+        failed=failed,
+        results=results,
+    )
 
 
 if __name__ == "__main__":

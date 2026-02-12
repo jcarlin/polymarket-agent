@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, Timelike, Utc};
 use futures::{stream, StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -90,16 +90,18 @@ async fn main() -> Result<()> {
     // Initialize components
     let scanner = MarketScanner::new(&config)?;
     let clob = ClobClient::new(&config.clob_api_url, config.scanner_request_timeout_secs)?;
-    let edge_detector = EdgeDetector::new(config.min_edge_threshold);
+    let edge_detector = EdgeDetector::new(config.min_edge_threshold, config.trading_fee_rate);
     let _position_sizer = PositionSizer::new(
         config.kelly_fraction,
         config.max_position_pct,
         config.max_total_exposure_pct,
+        config.trading_fee_rate,
     );
     let executor = Executor::new(
         &config.sidecar_url(),
         config.trading_mode.clone(),
         config.executor_request_timeout_secs,
+        config.trading_fee_rate,
     )?;
 
     // Initialize position manager (Phase 6)
@@ -111,6 +113,7 @@ async fn main() -> Result<()> {
         config.whale_move_threshold,
         config.max_correlated_exposure_pct,
         config.max_total_weather_exposure_pct,
+        config.trading_fee_rate,
     );
 
     // Initialize weather client (uses sidecar endpoint)
@@ -239,11 +242,21 @@ async fn main() -> Result<()> {
                     if let std::collections::hash_map::Entry::Vacant(entry) =
                         weather_cache.entry(key)
                     {
-                        match wc.get_probabilities(&info.city, &info.date).await {
+                        let today_str = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+                        let is_same_day = info.date == today_str;
+                        match wc.get_probabilities(&info.city, &info.date, is_same_day).await {
                             Ok(probs) => {
                                 info!(
-                                    "Weather data for {}/{}: mean={:.1}°F, std={:.1}°F",
-                                    info.city, info.date, probs.ensemble_mean, probs.ensemble_std
+                                    "Weather {}/{}: ensemble={:.1}°F, NWS={}, WU={}{} → to_llm={:.1}°F | std={:.1}°F, {} members, cal_bias={}",
+                                    info.city, info.date,
+                                    probs.raw_ensemble_mean,
+                                    probs.nws_forecast_high.map_or("n/a".to_string(), |h| format!("{:.0}°F", h)),
+                                    probs.wu_high.map_or("n/a".to_string(), |h| format!("{:.0}°F", h)),
+                                    probs.hrrr_max_temp.map_or(String::new(), |h| format!(", HRRR={:.0}°F", h)),
+                                    probs.ensemble_mean,
+                                    probs.ensemble_std,
+                                    probs.gefs_count + probs.ecmwf_count + probs.icon_count + probs.gem_count,
+                                    probs.calibration_bias.map_or("n/a".to_string(), |b| format!("{:+.1}°F", b)),
                                 );
                                 entry.insert(probs);
                             }
@@ -291,6 +304,40 @@ async fn main() -> Result<()> {
                     &bucket_json,
                 ) {
                     warn!("Failed to insert weather snapshot: {}", e);
+                }
+            }
+
+            // Collect WU actuals for past-date weather markets (resolution data)
+            if let Some(ref wc) = weather_client {
+                let today = Utc::now().date_naive();
+                for ((city, date), probs) in &weather_cache {
+                    if let Ok(forecast_date) = NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+                        if forecast_date < today {
+                            match wc
+                                .collect_wu_actual(
+                                    city,
+                                    date,
+                                    Some(probs.ensemble_mean),
+                                    probs.nws_forecast_high,
+                                )
+                                .await
+                            {
+                                Ok(Some(wu_high)) => {
+                                    info!(
+                                        "WU actual {}/{}: {:.0}°F (our forecast={:.1}°F, gap={:+.1}°F)",
+                                        city, date, wu_high, probs.ensemble_mean,
+                                        probs.ensemble_mean - wu_high,
+                                    );
+                                }
+                                Ok(None) => {
+                                    warn!("WU actual not available for {}/{}", city, date);
+                                }
+                                Err(e) => {
+                                    warn!("WU collect failed for {}/{}: {}", city, date, e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -422,6 +469,7 @@ async fn main() -> Result<()> {
             effective_kelly,
             config.max_position_pct,
             config.max_total_exposure_pct,
+            config.trading_fee_rate,
         );
 
         // Get current open positions for correlation checks
@@ -664,6 +712,27 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     warn!("Position management check failed: {}", e);
+                }
+            }
+        }
+
+        // Step 5.6: Daily WU actual collection & calibration
+        // Once per day (first cycle after midnight UTC), collect yesterday's actuals
+        if let Some(ref wc) = weather_client {
+            let now = Utc::now();
+            // Run daily collection at midnight UTC (hour 0, first cycle)
+            if now.hour() == 0 && cycle_number > 1 {
+                let yesterday = (now - chrono::Duration::days(1))
+                    .format("%Y-%m-%d")
+                    .to_string();
+                match wc.collect_actuals_batch(Some(&yesterday)).await {
+                    Ok(n) => info!("Daily WU collection: {} cities collected for {}", n, yesterday),
+                    Err(e) => warn!("Daily WU collection failed: {}", e),
+                }
+                // Trigger calibration after collecting actuals
+                match wc.trigger_calibration().await {
+                    Ok(n) => info!("Daily calibration: {} cities calibrated", n),
+                    Err(e) => warn!("Daily calibration failed: {}", e),
                 }
             }
         }

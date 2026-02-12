@@ -38,6 +38,8 @@ class WeatherProbabilities:
     hrrr_shift: float = 0.0
     nbm_max_temp: Optional[float] = None
     nbm_percentiles: Optional[dict] = None
+    calibration_bias: Optional[float] = None
+    calibration_spread: Optional[float] = None
 
 
 def compute_bucket_probabilities(
@@ -46,8 +48,11 @@ def compute_bucket_probabilities(
     bucket_width: float = 2.0,
     spread_correction: float = 1.0,
     nws_high: Optional[float] = None,
+    nws_weight: float = 0.6,
     hrrr_max: Optional[float] = None,
     hrrr_weight: float = 0.3,
+    calibration_bias: Optional[float] = None,
+    calibration_spread: Optional[float] = None,
 ) -> WeatherProbabilities:
     """Convert ensemble member temperatures to bucket probabilities using Gaussian KDE."""
     members = np.array(forecast.all_members, dtype=np.float64)
@@ -62,12 +67,19 @@ def compute_bucket_probabilities(
 
     raw_mean = float(np.mean(members))
 
-    # NWS bias correction: shift ensemble to anchor on calibrated forecast
+    # NWS bias correction: weighted blend (not 100% override)
     bias_correction = 0.0
     if nws_high is not None:
-        bias_correction = nws_high - raw_mean
+        target = nws_weight * nws_high + (1 - nws_weight) * raw_mean
+        bias_correction = target - raw_mean
         members = members + bias_correction
-        logger.info("NWS bias correction: shift=%.1f°F (raw_mean=%.1f, nws=%.1f)", bias_correction, raw_mean, nws_high)
+        logger.info("NWS bias correction: shift=%.1f°F (raw_mean=%.1f, nws=%.1f, weight=%.1f, target=%.1f)",
+                     bias_correction, raw_mean, nws_high, nws_weight, target)
+
+    # Calibration bias: shift toward WU resolution source (applied after NWS, before HRRR)
+    if calibration_bias is not None and calibration_bias != 0.0:
+        members = members + calibration_bias
+        logger.info("Calibration bias correction: +%.1f°F", calibration_bias)
 
     # HRRR anchoring: nudge distribution toward HRRR deterministic forecast
     hrrr_shift = 0.0
@@ -82,8 +94,11 @@ def compute_bucket_probabilities(
     std = float(np.std(members)) if len(members) > 1 else 0.0
 
     # Apply spread correction: corrected = mean + (val - mean) * factor
-    if spread_correction != 1.0:
-        corrected = mean + (members - mean) * spread_correction
+    effective_spread = spread_correction
+    if calibration_spread is not None:
+        effective_spread *= calibration_spread
+    if effective_spread != 1.0:
+        corrected = mean + (members - mean) * effective_spread
     else:
         corrected = members
 
@@ -148,6 +163,8 @@ def compute_bucket_probabilities(
         raw_ensemble_mean=raw_mean,
         hrrr_max_temp=hrrr_max,
         hrrr_shift=hrrr_shift,
+        calibration_bias=calibration_bias,
+        calibration_spread=calibration_spread,
     )
 
 

@@ -154,20 +154,22 @@ def test_histogram_fallback_with_few_members():
 
 
 def test_nws_bias_correction():
-    """NWS bias correction should shift ensemble mean to match NWS forecast."""
+    """NWS bias correction should shift ensemble mean between raw and NWS (weighted blend)."""
     rng = np.random.default_rng(42)
     members = list(rng.normal(30.0, 3.0, 82))
     forecast = _make_forecast(members)
-    result = compute_bucket_probabilities(forecast, nws_high=37.0)
-    assert abs(result.ensemble_mean - 37.0) < 0.5, (
-        f"Corrected ensemble_mean {result.ensemble_mean} should be ~37.0"
+    raw_mean = float(np.mean(members))
+    nws = 37.0
+    # Default weight=0.6: target = 0.6*37 + 0.4*raw_mean
+    result = compute_bucket_probabilities(forecast, nws_high=nws)
+    expected_target = 0.6 * nws + 0.4 * raw_mean
+    assert abs(result.ensemble_mean - expected_target) < 0.5, (
+        f"Corrected ensemble_mean {result.ensemble_mean} should be ~{expected_target:.1f} (weighted blend)"
     )
-    assert abs(result.bias_correction - 7.0) < 0.5, (
-        f"bias_correction {result.bias_correction} should be ~7.0"
-    )
-    assert abs(result.raw_ensemble_mean - 30.0) < 0.5, (
-        f"raw_ensemble_mean {result.raw_ensemble_mean} should be ~30.0"
-    )
+    # ensemble_mean should be between raw and NWS, not equal to NWS
+    assert result.ensemble_mean > raw_mean, "Should shift toward NWS"
+    assert result.ensemble_mean < nws, "Should not fully match NWS (weighted blend)"
+    assert abs(result.raw_ensemble_mean - 30.0) < 0.5
     assert result.nws_forecast_high == 37.0
 
 
@@ -265,6 +267,30 @@ def test_blend_probabilities_basic():
     blended = blend_probabilities(ensemble_buckets, nbm_buckets, nbm_weight=0.6)
     total = sum(b.probability for b in blended)
     assert abs(total - 1.0) < 0.01
+
+
+def test_nws_weight_one_full_override():
+    """With nws_weight=1.0, ensemble mean should equal NWS exactly (old behavior)."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(30.0, 3.0, 82))
+    forecast = _make_forecast(members)
+    result = compute_bucket_probabilities(forecast, nws_high=37.0, nws_weight=1.0)
+    assert abs(result.ensemble_mean - 37.0) < 0.5, (
+        f"With weight=1.0, ensemble_mean {result.ensemble_mean} should be ~37.0"
+    )
+
+
+def test_nws_weight_zero_no_nws():
+    """With nws_weight=0.0, NWS should have no effect on ensemble mean."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(30.0, 3.0, 82))
+    forecast = _make_forecast(members)
+    raw_mean = float(np.mean(members))
+    result = compute_bucket_probabilities(forecast, nws_high=37.0, nws_weight=0.0)
+    assert abs(result.ensemble_mean - raw_mean) < 0.5, (
+        f"With weight=0.0, ensemble_mean {result.ensemble_mean} should be ~{raw_mean:.1f} (raw)"
+    )
+    assert result.bias_correction == 0.0, "bias_correction should be 0 with weight=0"
 
 
 def test_blend_probabilities_no_nbm():

@@ -25,7 +25,7 @@ of an outcome, independent of what the market currently prices it at.
   {{gefs_member_temps}}
 - **ECMWF ensemble (51 members) daily max predictions:**
   {{ecmwf_member_temps}}
-- **Combined ensemble mean:** {{ensemble_mean}}°F
+- **Combined ensemble mean daily high:** {{ensemble_mean}}°F
 - **Combined ensemble std dev:** {{ensemble_std}}°F
 - **Model probability for this outcome:** {{model_probability}}%
 {{/if}}

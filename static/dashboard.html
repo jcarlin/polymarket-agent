@@ -62,6 +62,11 @@
 
     table { width: 100%; border-collapse: collapse; font-size: 12px; }
     th { text-align: left; color: var(--text-dim); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    th.sortable { cursor: pointer; user-select: none; }
+    th.sortable:hover { color: var(--accent); }
+    th.sortable::after { content: ' \2195'; font-size: 10px; opacity: 0.4; }
+    th.sort-asc::after { content: ' \2191'; opacity: 1; }
+    th.sort-desc::after { content: ' \2193'; opacity: 1; }
     td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
     tr:last-child td { border-bottom: none; }
     .side-yes { color: var(--green); }
@@ -92,6 +97,7 @@
     <div class="stat"><div class="stat-label">Trades</div><div class="stat-value" id="s-trades">--</div></div>
     <div class="stat"><div class="stat-label">Cycles</div><div class="stat-value" id="s-cycles">--</div></div>
     <div class="stat"><div class="stat-label">API Cost (24h)</div><div class="stat-value" id="s-api">--</div></div>
+    <div class="stat"><div class="stat-label">Trading Fees</div><div class="stat-value" id="s-fees">--</div></div>
   </div>
 
   <div class="grid">
@@ -104,7 +110,7 @@
       <div class="card-body" id="positions-body"><div class="empty-msg">No open positions</div></div>
     </div>
     <div class="card">
-      <div class="card-header">Recent Trades</div>
+      <div class="card-header">Trade History</div>
       <div class="card-body" id="trades-body"><div class="empty-msg">No trades yet</div></div>
     </div>
     <div class="card">
@@ -127,14 +133,48 @@ const usd = v => v != null ? '$' + Number(v).toFixed(2) : '--';
 const pnlClass = v => v >= 0 ? 'pnl-pos' : 'pnl-neg';
 const sideClass = s => s === 'YES' || s === 'Yes' ? 'side-yes' : 'side-no';
 const shortId = id => id && id.length > 10 ? id.slice(0, 6) + '...' + id.slice(-4) : id;
-const fmtTime = ts => {
+const fmtTimestamp = ts => {
   if (!ts) return '';
   const d = new Date(ts.includes('T') ? ts : ts + 'Z');
-  return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  return d.toLocaleDateString([], {month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
 };
 
 let initialBankroll = 50;
 let chart;
+let lastTrades = [];
+let lastOpportunities = [];
+const sortState = {}; // { tableId: { col: string, asc: bool } }
+
+function sortBy(arr, key, asc, getter) {
+  return [...arr].sort((a, b) => {
+    let va = getter ? getter(a) : a[key];
+    let vb = getter ? getter(b) : b[key];
+    if (va == null) va = asc ? Infinity : -Infinity;
+    if (vb == null) vb = asc ? Infinity : -Infinity;
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va < vb) return asc ? -1 : 1;
+    if (va > vb) return asc ? 1 : -1;
+    return 0;
+  });
+}
+
+function attachSort(tableEl, tableId, cols, renderFn) {
+  const ths = tableEl.querySelectorAll('th.sortable');
+  ths.forEach(th => {
+    th.addEventListener('click', () => {
+      const col = th.dataset.col;
+      const prev = sortState[tableId];
+      const asc = prev && prev.col === col ? !prev.asc : true;
+      sortState[tableId] = { col, asc };
+      const getter = cols[col];
+      const data = tableId === 'trades' ? lastTrades : lastOpportunities;
+      const sorted = sortBy(data, col, asc, getter);
+      if (tableId === 'trades') renderTradesTable(sorted);
+      else renderOppsTable(sorted);
+    });
+  });
+}
 
 function initChart(history) {
   const labels = history.map(h => h.cycle_number);
@@ -172,6 +212,7 @@ function updateStats(s) {
   $('s-trades').textContent = s.total_trades;
   $('s-cycles').textContent = s.next_cycle - 1;
   $('s-api').textContent = usd(s.api_cost_24h);
+  $('s-fees').textContent = usd(s.total_trading_fees);
 
   const badge = $('mode-badge');
   badge.textContent = s.trading_mode.toUpperCase();
@@ -196,21 +237,72 @@ function renderPositions(positions) {
   el.innerHTML = html + '</table>';
 }
 
-function renderTrades(trades) {
+function tradePnl(t) {
+  if (t.position_status === 'closed' && t.realized_pnl != null) return t.realized_pnl;
+  if (t.unrealized_pnl != null) return t.unrealized_pnl;
+  return null;
+}
+
+const tradeSortCols = {
+  time: t => t.created_at || '',
+  market: t => (t.question || t.market_condition_id || ''),
+  side: t => t.side,
+  price: t => t.price,
+  size: t => t.size,
+  fee: t => t.entry_fee || 0,
+  pnl: t => tradePnl(t),
+  status: t => t.position_status || '',
+  mode: t => t.paper ? 0 : 1,
+};
+
+function tradeHeaders() {
+  const st = sortState['trades'];
+  const cls = col => 'sortable' + (st && st.col === col ? (st.asc ? ' sort-asc' : ' sort-desc') : '');
+  return `<tr>
+    <th class="${cls('time')}" data-col="time">Timestamp</th>
+    <th class="${cls('market')}" data-col="market">Market</th>
+    <th class="${cls('side')}" data-col="side">Side</th>
+    <th class="${cls('price')}" data-col="price">Price</th>
+    <th class="${cls('size')}" data-col="size">Size</th>
+    <th class="${cls('fee')}" data-col="fee">Fee</th>
+    <th class="${cls('pnl')}" data-col="pnl">P&amp;L</th>
+    <th class="${cls('status')}" data-col="status">Status</th>
+    <th class="${cls('mode')}" data-col="mode">Mode</th>
+  </tr>`;
+}
+
+function renderTradesTable(trades) {
   const el = $('trades-body');
-  if (!trades.length) { el.innerHTML = '<div class="empty-msg">No trades yet</div>'; return; }
-  let html = '<table><tr><th>Time</th><th>Side</th><th>Market</th><th>Price</th><th>Size</th><th>Mode</th></tr>';
+  let html = '<table>' + tradeHeaders();
   for (const t of trades) {
+    const q = t.question ? (t.question.length > 50 ? t.question.slice(0,47) + '...' : t.question) : shortId(t.market_condition_id);
+    const pnl = tradePnl(t);
+    const pnlStr = pnl != null ? ((pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2)) : '--';
+    const pnlCls = pnl != null ? pnlClass(pnl) : '';
+    const posStatus = t.position_status === 'closed' ? 'Closed' : t.position_status === 'open' ? 'Open' : '--';
     html += `<tr>
-      <td>${fmtTime(t.created_at)}</td>
+      <td>${fmtTimestamp(t.created_at)}</td>
+      <td title="${(t.question||t.market_condition_id).replace(/"/g,'&quot;')}">${q}</td>
       <td class="${sideClass(t.side)}">${t.side}</td>
-      <td title="${t.market_condition_id}">${shortId(t.market_condition_id)}</td>
       <td>${t.price.toFixed(2)}</td>
       <td>${t.size.toFixed(1)}</td>
+      <td>${t.entry_fee > 0 ? '$' + t.entry_fee.toFixed(4) : '--'}</td>
+      <td class="${pnlCls}">${pnlStr}</td>
+      <td>${posStatus}</td>
       <td>${t.paper ? 'PAPER' : 'LIVE'}</td>
     </tr>`;
   }
   el.innerHTML = html + '</table>';
+  attachSort(el.querySelector('table'), 'trades', tradeSortCols);
+}
+
+function renderTrades(trades) {
+  lastTrades = trades;
+  const el = $('trades-body');
+  if (!trades.length) { el.innerHTML = '<div class="empty-msg">No trades yet</div>'; return; }
+  const st = sortState['trades'];
+  const sorted = st ? sortBy(trades, st.col, st.asc, tradeSortCols[st.col]) : trades;
+  renderTradesTable(sorted);
 }
 
 function renderAlerts(alerts) {
@@ -219,7 +311,7 @@ function renderAlerts(alerts) {
   el.innerHTML = alerts.map(a => `
     <div class="alert-item">
       <span class="alert-type">${a.alert_type}</span>
-      <span class="alert-time">${fmtTime(a.created_at)}</span><br>
+      <span class="alert-time">${fmtTimestamp(a.created_at)}</span><br>
       ${a.details || ''} <span style="color:var(--text-dim)">${shortId(a.market_condition_id)}</span>
     </div>
   `).join('');
@@ -227,16 +319,20 @@ function renderAlerts(alerts) {
 
 function prependTrade(t) {
   const el = $('trades-body');
-  if (el.querySelector('.empty-msg')) el.innerHTML = '<table><tr><th>Time</th><th>Side</th><th>Market</th><th>Price</th><th>Size</th><th>Mode</th></tr></table>';
+  if (el.querySelector('.empty-msg')) el.innerHTML = '<table><tr><th>Timestamp</th><th>Market</th><th>Side</th><th>Price</th><th>Size</th><th>Fee</th><th>P&L</th><th>Status</th><th>Mode</th></tr></table>';
   const table = el.querySelector('table');
   if (!table) return;
+  const q = t.question ? (t.question.length > 50 ? t.question.slice(0,47) + '...' : t.question) : shortId(t.market_id);
   const row = document.createElement('tr');
   row.innerHTML = `
-    <td>${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
+    <td>${fmtTimestamp(new Date().toISOString())}</td>
+    <td title="${(t.question||t.market_id||'').replace(/"/g,'&quot;')}">${q}</td>
     <td class="${sideClass(t.side)}">${t.side}</td>
-    <td title="${t.market_id}">${shortId(t.market_id)}</td>
     <td>${t.price.toFixed(2)}</td>
     <td>${t.size.toFixed(1)}</td>
+    <td>${t.entry_fee > 0 ? '$' + t.entry_fee.toFixed(4) : '--'}</td>
+    <td>--</td>
+    <td>Open</td>
     <td>${t.paper ? 'PAPER' : 'LIVE'}</td>`;
   const firstRow = table.querySelector('tr:nth-child(2)');
   if (firstRow) table.insertBefore(row, firstRow);
@@ -259,14 +355,38 @@ function renderWeather(data) {
   el.innerHTML = html + '</table>';
 }
 
-function renderOpportunities(data) {
+const oppSortCols = {
+  time: o => o.created_at || '',
+  market: o => o.question,
+  side: o => o.side,
+  mkt: o => o.market_price,
+  model: o => o.estimated_probability,
+  edge: o => o.edge,
+  status: o => o.status,
+};
+
+function oppHeaders() {
+  const st = sortState['opps'];
+  const cls = col => 'sortable' + (st && st.col === col ? (st.asc ? ' sort-asc' : ' sort-desc') : '');
+  return `<tr>
+    <th class="${cls('time')}" data-col="time">Timestamp</th>
+    <th class="${cls('market')}" data-col="market">Market</th>
+    <th class="${cls('side')}" data-col="side">Side</th>
+    <th class="${cls('mkt')}" data-col="mkt">Mkt</th>
+    <th class="${cls('model')}" data-col="model">Model</th>
+    <th class="${cls('edge')}" data-col="edge">Edge</th>
+    <th class="${cls('status')}" data-col="status">Status</th>
+  </tr>`;
+}
+
+function renderOppsTable(data) {
   const el = $('opportunities-body');
-  if (!data.length) { el.innerHTML = '<div class="empty-msg">No opportunities</div>'; return; }
-  let html = '<table><tr><th>Market</th><th>Side</th><th>Mkt</th><th>Model</th><th>Edge</th><th>Status</th></tr>';
+  let html = '<table>' + oppHeaders();
   for (const o of data) {
     const q = o.question.length > 35 ? o.question.slice(0,32) + '...' : o.question;
     const statusColor = o.status === 'executed' ? 'var(--green)' : o.status === 'rejected' ? 'var(--yellow)' : 'var(--text-dim)';
     html += `<tr>
+      <td>${fmtTimestamp(o.created_at)}</td>
       <td title="${o.question.replace(/"/g,'&quot;')}">${q}</td>
       <td class="${sideClass(o.side)}">${o.side}</td>
       <td>${o.market_price.toFixed(2)}</td>
@@ -276,6 +396,16 @@ function renderOpportunities(data) {
     </tr>`;
   }
   el.innerHTML = html + '</table>';
+  attachSort(el.querySelector('table'), 'opps', oppSortCols);
+}
+
+function renderOpportunities(data) {
+  lastOpportunities = data;
+  const el = $('opportunities-body');
+  if (!data.length) { el.innerHTML = '<div class="empty-msg">No opportunities</div>'; return; }
+  const st = sortState['opps'];
+  const sorted = st ? sortBy(data, st.col, st.asc, oppSortCols[st.col]) : data;
+  renderOppsTable(sorted);
 }
 
 // ─── Data fetching ─────────────────────────────────

@@ -20,6 +20,7 @@ pub struct DeathReport {
     pub cycles_completed: i64,
     pub total_trades: i64,
     pub total_pnl: f64,
+    pub total_trading_fees: f64,
     pub final_bankroll: f64,
     pub open_positions: usize,
     pub cause: String,
@@ -97,6 +98,7 @@ impl Accountant {
             )
             .context("Failed to get initial seed")?;
         let total_pnl = final_bankroll - initial_seed;
+        let total_trading_fees = db.get_total_trading_fees();
 
         let cause = if final_bankroll <= 0.0 {
             "Bankroll depleted to zero".to_string()
@@ -108,6 +110,7 @@ impl Accountant {
             cycles_completed,
             total_trades,
             total_pnl,
+            total_trading_fees,
             final_bankroll,
             open_positions,
             cause,
@@ -125,6 +128,7 @@ impl DeathReport {
         info!("║ Cycles completed: {:<22}║", self.cycles_completed);
         info!("║ Total trades: {:<26}║", self.total_trades);
         info!("║ Total P&L: ${:<28.2}║", self.total_pnl);
+        info!("║ Trading fees: ${:<26.2}║", self.total_trading_fees);
         info!("║ Final bankroll: ${:<24.2}║", self.final_bankroll);
         info!("║ Open positions: {:<24}║", self.open_positions);
         info!("╠══════════════════════════════════════════╣");
@@ -236,7 +240,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        db.insert_trade("t1", "0xdead", "tok1", "YES", 0.60, 5.0, "filled", true)
+        db.insert_trade("t1", "0xdead", "tok1", "YES", 0.60, 5.0, "filled", true, 0.0)
             .unwrap();
 
         // Deduct some cost

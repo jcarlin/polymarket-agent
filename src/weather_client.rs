@@ -105,6 +105,12 @@ pub struct WeatherProbabilities {
     pub hrrr_shift: f64,
     #[serde(default)]
     pub nbm_max_temp: Option<f64>,
+    #[serde(default)]
+    pub calibration_bias: Option<f64>,
+    #[serde(default)]
+    pub calibration_spread: Option<f64>,
+    #[serde(default)]
+    pub wu_high: Option<f64>,
 }
 
 /// Parsed weather market info from Polymarket question text
@@ -138,11 +144,19 @@ impl WeatherClient {
     }
 
     /// Fetch weather probabilities for a single city/date
-    pub async fn get_probabilities(&self, city: &str, date: &str) -> Result<WeatherProbabilities> {
-        let url = format!(
+    pub async fn get_probabilities(
+        &self,
+        city: &str,
+        date: &str,
+        same_day: bool,
+    ) -> Result<WeatherProbabilities> {
+        let mut url = format!(
             "{}/weather/probabilities?city={}&date={}",
             self.base_url, city, date
         );
+        if same_day {
+            url.push_str("&same_day=true");
+        }
 
         let mut last_err = None;
         for attempt in 0..=self.max_retries {
@@ -185,11 +199,116 @@ impl WeatherClient {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Weather API failed after retries")))
     }
 
+    /// Collect WU actual for a single city/date and store in weather_actuals
+    pub async fn collect_wu_actual(
+        &self,
+        city: &str,
+        date: &str,
+        ensemble_mean: Option<f64>,
+        nws_forecast_high: Option<f64>,
+    ) -> Result<Option<f64>> {
+        let url = format!("{}/weather/collect_actual", self.base_url);
+
+        let mut body = serde_json::json!({
+            "city": city,
+            "date": date,
+        });
+        if let Some(em) = ensemble_mean {
+            body["ensemble_mean"] = serde_json::json!(em);
+        }
+        if let Some(nws) = nws_forecast_high {
+            body["nws_forecast_high"] = serde_json::json!(nws);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to call collect_actual")?;
+
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("collect_actual returned {}: {}", code, body);
+        }
+
+        #[derive(Deserialize)]
+        struct CollectResponse {
+            wu_actual_high: Option<f64>,
+        }
+        let result: CollectResponse = resp
+            .json()
+            .await
+            .context("Failed to parse collect_actual response")?;
+        Ok(result.wu_actual_high)
+    }
+
+    /// Collect WU actuals for all cities for a given date (or yesterday if None)
+    pub async fn collect_actuals_batch(&self, date: Option<&str>) -> Result<u32> {
+        let mut url = format!("{}/weather/collect_actuals_batch", self.base_url);
+        if let Some(d) = date {
+            url = format!("{}?date={}", url, d);
+        }
+
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .context("Failed to call collect_actuals_batch")?;
+
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("collect_actuals_batch returned {}: {}", code, body);
+        }
+
+        #[derive(Deserialize)]
+        struct BatchResponse {
+            collected: u32,
+        }
+        let result: BatchResponse = resp
+            .json()
+            .await
+            .context("Failed to parse collect_actuals_batch response")?;
+        Ok(result.collected)
+    }
+
+    /// Trigger calibration recomputation on the sidecar
+    pub async fn trigger_calibration(&self) -> Result<u32> {
+        let url = format!("{}/weather/calibrate", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .context("Failed to call calibrate")?;
+
+        if !resp.status().is_success() {
+            let code = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("calibrate returned {}: {}", code, body);
+        }
+
+        #[derive(Deserialize)]
+        struct CalibResponse {
+            cities_calibrated: u32,
+        }
+        let result: CalibResponse = resp
+            .json()
+            .await
+            .context("Failed to parse calibrate response")?;
+        Ok(result.cities_calibrated)
+    }
+
     /// Fetch weather probabilities for multiple cities in parallel
     pub async fn get_probabilities_batch(
         &self,
         cities: &[String],
         date: &str,
+        same_day: bool,
     ) -> Vec<(String, WeatherProbabilities)> {
         let mut results = Vec::new();
         let mut handles = Vec::new();
@@ -207,7 +326,7 @@ impl WeatherClient {
                     base_url,
                     max_retries,
                 };
-                match weather_client.get_probabilities(&city, &date).await {
+                match weather_client.get_probabilities(&city, &date, same_day).await {
                     Ok(probs) => Some((city, probs)),
                     Err(e) => {
                         warn!("Batch weather fetch failed for {}: {}", city, e);
@@ -478,7 +597,7 @@ mod tests {
             .await;
 
         let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
-        let result = client.get_probabilities("NYC", "2026-02-20").await.unwrap();
+        let result = client.get_probabilities("NYC", "2026-02-20", false).await.unwrap();
 
         assert_eq!(result.city, "NYC");
         assert_eq!(result.station_icao, "KLGA");
@@ -499,7 +618,7 @@ mod tests {
             .await;
 
         let client = WeatherClient::new(&server.uri(), 5, 0).unwrap();
-        let result = client.get_probabilities("UNKNOWN", "2026-02-20").await;
+        let result = client.get_probabilities("UNKNOWN", "2026-02-20", false).await;
         assert!(result.is_err());
     }
 
@@ -515,7 +634,7 @@ mod tests {
             .await;
 
         let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
-        let result = client.get_probabilities("NYC", "2026-02-20").await;
+        let result = client.get_probabilities("NYC", "2026-02-20", false).await;
         assert!(result.is_err());
     }
 
@@ -531,7 +650,7 @@ mod tests {
 
         let client = WeatherClient::new(&server.uri(), 5, 1).unwrap();
         let cities = vec!["NYC".to_string(), "CHI".to_string()];
-        let results = client.get_probabilities_batch(&cities, "2026-02-20").await;
+        let results = client.get_probabilities_batch(&cities, "2026-02-20", false).await;
         assert_eq!(results.len(), 2);
     }
 

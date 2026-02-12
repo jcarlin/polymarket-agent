@@ -12,6 +12,11 @@ pub struct TradeRow {
     pub status: String,
     pub paper: bool,
     pub created_at: String,
+    pub question: Option<String>,
+    pub realized_pnl: Option<f64>,
+    pub unrealized_pnl: Option<f64>,
+    pub position_status: Option<String>,
+    pub entry_fee: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -189,10 +194,11 @@ impl Database {
         size: f64,
         status: &str,
         paper: bool,
+        entry_fee: f64,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO trades (trade_id, market_condition_id, token_id, side, price, size, status, paper) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![trade_id, market_condition_id, token_id, side, price, size, status, paper],
+            "INSERT INTO trades (trade_id, market_condition_id, token_id, side, price, size, status, paper, entry_fee) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![trade_id, market_condition_id, token_id, side, price, size, status, paper, entry_fee],
         ).context("Failed to insert trade")?;
         Ok(())
     }
@@ -630,6 +636,19 @@ impl Database {
         Ok(())
     }
 
+    /// Get total trading fees from bankroll_log.
+    pub fn get_total_trading_fees(&self) -> f64 {
+        let fees: f64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(ABS(amount)), 0.0) FROM bankroll_log WHERE entry_type = 'trading_fee'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        fees
+    }
+
     /// Get total weather losses for today (approximate via bankroll_log description matching).
     pub fn get_weather_losses_today(&self) -> f64 {
         let loss: f64 = self
@@ -724,7 +743,18 @@ impl Database {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT trade_id, market_condition_id, side, price, size, status, paper, created_at FROM trades ORDER BY id DESC LIMIT ?1",
+                "SELECT t.trade_id, t.market_condition_id, t.side, t.price, t.size, t.status, t.paper, t.created_at, \
+                 m.question, \
+                 p.realized_pnl, p.unrealized_pnl, p.status, \
+                 t.entry_fee \
+                 FROM trades t \
+                 LEFT JOIN markets m ON t.market_condition_id = m.condition_id \
+                 LEFT JOIN positions p ON p.id = ( \
+                   SELECT id FROM positions p2 \
+                   WHERE p2.market_condition_id = t.market_condition_id AND p2.side = t.side \
+                   ORDER BY p2.id DESC LIMIT 1 \
+                 ) \
+                 ORDER BY t.id DESC LIMIT ?1",
             )
             .context("Failed to prepare recent trades query")?;
         let rows = stmt
@@ -738,6 +768,11 @@ impl Database {
                     status: row.get(5)?,
                     paper: row.get(6)?,
                     created_at: row.get(7)?,
+                    question: row.get(8)?,
+                    realized_pnl: row.get(9)?,
+                    unrealized_pnl: row.get(10)?,
+                    position_status: row.get(11)?,
+                    entry_fee: row.get::<_, Option<f64>>(12)?.unwrap_or(0.0),
                 })
             })
             .context("Failed to query recent trades")?;
@@ -912,6 +947,12 @@ impl Database {
             )
             .context("Failed to run database migrations")?;
 
+        // Add entry_fee column to trades (idempotent)
+        let _ = self.conn.execute(
+            "ALTER TABLE trades ADD COLUMN entry_fee REAL DEFAULT 0.0",
+            [],
+        );
+
         // Phase 6: Add estimated_probability column to positions (idempotent)
         let _ = self.conn.execute(
             "ALTER TABLE positions ADD COLUMN estimated_probability REAL",
@@ -1073,6 +1114,7 @@ mod tests {
             10.0,
             "filled",
             true,
+            0.0,
         )
         .unwrap();
 
@@ -1217,11 +1259,11 @@ mod tests {
     fn test_get_recent_trades() {
         let db = Database::open_in_memory().unwrap();
         insert_test_market(&db, "0xcond1");
-        db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true)
+        db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true, 0.0)
             .unwrap();
-        db.insert_trade("t2", "0xcond1", "tok1", "NO", 0.40, 3.0, "filled", true)
+        db.insert_trade("t2", "0xcond1", "tok1", "NO", 0.40, 3.0, "filled", true, 0.0)
             .unwrap();
-        db.insert_trade("t3", "0xcond1", "tok1", "YES", 0.70, 2.0, "filled", true)
+        db.insert_trade("t3", "0xcond1", "tok1", "YES", 0.70, 2.0, "filled", true, 0.0)
             .unwrap();
 
         let trades = db.get_recent_trades(2).unwrap();
@@ -1236,7 +1278,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(db.get_total_trades_count().unwrap(), 0);
         insert_test_market(&db, "0xcond1");
-        db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true)
+        db.insert_trade("t1", "0xcond1", "tok1", "YES", 0.60, 5.0, "filled", true, 0.0)
             .unwrap();
         assert_eq!(db.get_total_trades_count().unwrap(), 1);
     }

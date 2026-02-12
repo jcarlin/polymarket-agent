@@ -55,6 +55,7 @@ pub struct PositionManager {
     pub whale_move_threshold: f64,
     pub max_correlated_exposure_pct: f64,
     pub max_total_weather_exposure_pct: f64,
+    pub fee_rate: f64,
     correlation_groups: Vec<CorrelationGroup>,
 }
 
@@ -67,6 +68,7 @@ impl PositionManager {
         whale_move_threshold: f64,
         max_correlated_exposure_pct: f64,
         max_total_weather_exposure_pct: f64,
+        fee_rate: f64,
     ) -> Self {
         let correlation_groups = vec![
             CorrelationGroup {
@@ -114,6 +116,7 @@ impl PositionManager {
             whale_move_threshold,
             max_correlated_exposure_pct,
             max_total_weather_exposure_pct,
+            fee_rate,
             correlation_groups,
         }
     }
@@ -157,7 +160,9 @@ impl PositionManager {
             let mut pos_refreshed = pos.clone();
             if let (Some(wc), Some(question)) = (weather_client, pos.question.as_ref()) {
                 if let Some(info) = parse_weather_market(question) {
-                    match wc.get_probabilities(&info.city, &info.date).await {
+                    let today_str = chrono::Utc::now().date_naive().format("%Y-%m-%d").to_string();
+                    let is_same_day = info.date == today_str;
+                    match wc.get_probabilities(&info.city, &info.date, is_same_day).await {
                         Ok(probs) => {
                             if let Some(fresh_prob) = get_weather_model_probability(&info, &probs) {
                                 info!(
@@ -274,13 +279,16 @@ impl PositionManager {
         PositionAction::Hold
     }
 
-    /// Stop-loss: exit if position is down more than stop_loss_pct from entry.
+    /// Stop-loss: exit if position is down more than stop_loss_pct from entry (fee-aware).
     fn check_stop_loss(&self, pos: &PositionRow, current_price: f64) -> Option<PositionAction> {
         if pos.entry_price <= 0.0 {
             return None;
         }
 
-        let loss_pct = (pos.entry_price - current_price) / pos.entry_price;
+        // Fee-aware: entry cost includes entry fee, exit proceeds minus exit fee
+        let entry_cost = pos.entry_price * (1.0 + self.fee_rate);
+        let exit_proceeds = current_price * (1.0 - self.fee_rate);
+        let loss_pct = (entry_cost - exit_proceeds) / entry_cost;
 
         if loss_pct > self.stop_loss_pct {
             Some(PositionAction::Exit {
@@ -297,20 +305,22 @@ impl PositionManager {
         }
     }
 
-    /// Take-profit: exit if we've captured enough of the expected value.
-    /// For a binary market position bought at entry_price, max profit is (1.0 - entry_price).
-    /// We exit when (current - entry) / (1.0 - entry) >= take_profit_pct.
+    /// Take-profit: exit if we've captured enough of the expected value (fee-aware).
+    /// max_profit = (1 - fee_rate) - entry_price * (1 + fee_rate)
+    /// current_profit = current_price * (1 - fee_rate) - entry_price * (1 + fee_rate)
     fn check_take_profit(&self, pos: &PositionRow, current_price: f64) -> Option<PositionAction> {
         if pos.entry_price >= 1.0 {
             return None;
         }
 
-        let max_profit = 1.0 - pos.entry_price;
+        let entry_cost = pos.entry_price * (1.0 + self.fee_rate);
+        let max_profit = (1.0 - self.fee_rate) - entry_cost;
         if max_profit <= 0.0 {
             return None;
         }
 
-        let current_profit = current_price - pos.entry_price;
+        let exit_proceeds = current_price * (1.0 - self.fee_rate);
+        let current_profit = exit_proceeds - entry_cost;
         let captured_pct = current_profit / max_profit;
 
         if captured_pct >= self.take_profit_pct {
@@ -329,12 +339,13 @@ impl PositionManager {
     }
 
     /// Edge decay: if we stored the estimated probability at entry, check if the
-    /// current edge has fallen below min_exit_edge.
+    /// current net edge (after fees) has fallen below min_exit_edge.
     fn check_edge_decay(&self, pos: &PositionRow, current_price: f64) -> Option<PositionAction> {
         let estimated_prob = pos.estimated_probability?;
 
-        // Compute current edge the same way as at entry
-        let current_edge = (estimated_prob - current_price).abs();
+        // Compute current edge and subtract round-trip fees
+        let raw_edge = (estimated_prob - current_price).abs();
+        let current_edge = raw_edge - 2.0 * self.fee_rate;
 
         if current_edge < self.min_exit_edge {
             Some(PositionAction::Exit {
@@ -511,7 +522,7 @@ mod tests {
     use super::*;
 
     fn make_manager() -> PositionManager {
-        PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.10, 0.25)
+        PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.10, 0.25, 0.0)
     }
 
     fn make_position(entry_price: f64, size: f64) -> PositionRow {

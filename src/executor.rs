@@ -46,10 +46,11 @@ pub struct Executor {
     client: Client,
     sidecar_url: String,
     trading_mode: TradingMode,
+    fee_rate: f64,
 }
 
 impl Executor {
-    pub fn new(sidecar_url: &str, trading_mode: TradingMode, timeout_secs: u64) -> Result<Self> {
+    pub fn new(sidecar_url: &str, trading_mode: TradingMode, timeout_secs: u64, fee_rate: f64) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .build()
@@ -59,6 +60,7 @@ impl Executor {
             client,
             sidecar_url: sidecar_url.trim_end_matches('/').to_string(),
             trading_mode,
+            fee_rate,
         })
     }
 
@@ -68,6 +70,7 @@ impl Executor {
             client,
             sidecar_url,
             trading_mode,
+            fee_rate: 0.0,
         }
     }
 
@@ -82,6 +85,8 @@ impl Executor {
         let trade_id = uuid::Uuid::new_v4().to_string();
         let side_str = intent.opportunity.side.to_string();
 
+        let entry_fee = self.fee_rate * intent.sizing.position_usd;
+
         // Log trade
         db.insert_trade(
             &trade_id,
@@ -92,6 +97,7 @@ impl Executor {
             intent.sizing.shares,
             "filled",
             true,
+            entry_fee,
         )?;
 
         // Update position
@@ -119,13 +125,25 @@ impl Executor {
             ),
         )?;
 
+        // Log trading fee as separate bankroll entry
+        if entry_fee > 0.0 {
+            let bankroll_after_fee = new_bankroll - entry_fee;
+            db.log_bankroll_entry(
+                "trading_fee",
+                -entry_fee,
+                bankroll_after_fee,
+                &format!("Entry fee: {:.1}% on ${:.2}", self.fee_rate * 100.0, intent.sizing.position_usd),
+            )?;
+        }
+
         info!(
-            "PAPER TRADE: {} {} @ {:.2} ({:.1} shares, ${:.2})",
+            "PAPER TRADE: {} {} @ {:.2} ({:.1} shares, ${:.2}, fee=${:.4})",
             side_str,
             intent.opportunity.question,
             intent.sizing.limit_price,
             intent.sizing.shares,
             intent.sizing.position_usd,
+            entry_fee,
         );
 
         Ok(TradeResult {
@@ -142,6 +160,7 @@ impl Executor {
 
     async fn execute_live(&self, intent: &TradeIntent, db: &Database) -> Result<TradeResult> {
         let side_str = intent.opportunity.side.to_string();
+        let entry_fee = self.fee_rate * intent.sizing.position_usd;
 
         let request = SidecarOrderRequest {
             token_id: intent.token_id.clone(),
@@ -179,6 +198,7 @@ impl Executor {
             intent.sizing.shares,
             &order_resp.status,
             false,
+            entry_fee,
         )?;
 
         // Update position
@@ -206,13 +226,25 @@ impl Executor {
             ),
         )?;
 
+        // Log trading fee as separate bankroll entry
+        if entry_fee > 0.0 {
+            let bankroll_after_fee = new_bankroll - entry_fee;
+            db.log_bankroll_entry(
+                "trading_fee",
+                -entry_fee,
+                bankroll_after_fee,
+                &format!("Entry fee: {:.1}% on ${:.2}", self.fee_rate * 100.0, intent.sizing.position_usd),
+            )?;
+        }
+
         info!(
-            "LIVE TRADE: {} {} @ {:.2} ({:.1} shares, ${:.2}) order_id={}",
+            "LIVE TRADE: {} {} @ {:.2} ({:.1} shares, ${:.2}, fee=${:.4}) order_id={}",
             side_str,
             intent.opportunity.question,
             intent.sizing.limit_price,
             intent.sizing.shares,
             intent.sizing.position_usd,
+            entry_fee,
             order_resp.order_id,
         );
 
@@ -256,6 +288,7 @@ impl Executor {
             position.size,
             "filled",
             true,
+            0.0,
         )?;
 
         // Close position in DB
@@ -280,9 +313,21 @@ impl Executor {
             ),
         )?;
 
+        // Log exit trading fee
+        let exit_fee = self.fee_rate * proceeds;
+        if exit_fee > 0.0 {
+            let bankroll_after_fee = new_bankroll - exit_fee;
+            db.log_bankroll_entry(
+                "trading_fee",
+                -exit_fee,
+                bankroll_after_fee,
+                &format!("Exit fee: {:.1}% on ${:.2}", self.fee_rate * 100.0, proceeds),
+            )?;
+        }
+
         info!(
-            "PAPER EXIT: {} {} @ {:.2} ({:.1} shares, pnl=${:.2})",
-            position.side, position.market_condition_id, exit_price, position.size, realized_pnl,
+            "PAPER EXIT: {} {} @ {:.2} ({:.1} shares, pnl=${:.2}, fee=${:.4})",
+            position.side, position.market_condition_id, exit_price, position.size, realized_pnl, exit_fee,
         );
 
         Ok(realized_pnl)
@@ -332,6 +377,7 @@ impl Executor {
             position.size,
             &order_resp.status,
             false,
+            0.0,
         )?;
 
         // Close position in DB
@@ -356,13 +402,26 @@ impl Executor {
             ),
         )?;
 
+        // Log exit trading fee
+        let exit_fee = self.fee_rate * proceeds;
+        if exit_fee > 0.0 {
+            let bankroll_after_fee = new_bankroll - exit_fee;
+            db.log_bankroll_entry(
+                "trading_fee",
+                -exit_fee,
+                bankroll_after_fee,
+                &format!("Exit fee: {:.1}% on ${:.2}", self.fee_rate * 100.0, proceeds),
+            )?;
+        }
+
         info!(
-            "LIVE EXIT: {} {} @ {:.2} ({:.1} shares, pnl=${:.2}) order_id={}",
+            "LIVE EXIT: {} {} @ {:.2} ({:.1} shares, pnl=${:.2}, fee=${:.4}) order_id={}",
             position.side,
             position.market_condition_id,
             exit_price,
             position.size,
             realized_pnl,
+            exit_fee,
             order_resp.order_id,
         );
 
@@ -386,6 +445,7 @@ mod tests {
                 estimated_probability: 0.75,
                 market_price: 0.55,
                 edge: 0.20,
+                net_edge: 0.20,
                 confidence: 0.85,
                 data_quality: "high".to_string(),
                 reasoning: "Test".to_string(),
@@ -398,6 +458,7 @@ mod tests {
                 position_usd: 3.0,
                 shares: 5.45,
                 limit_price: 0.55,
+                entry_fee: 0.06,
                 reject_reason: None,
             },
         }

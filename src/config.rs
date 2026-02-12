@@ -66,6 +66,9 @@ pub struct Config {
     pub executor_request_timeout_secs: u64,
     // Weather (Phase 5)
     pub weather_spread_correction: f64,
+    pub weather_default_bias_offset: f64,
+    // Trading fees
+    pub trading_fee_rate: f64,
     // Position management & risk (Phase 6)
     pub stop_loss_pct: f64,
     pub take_profit_pct: f64,
@@ -191,6 +194,14 @@ impl Config {
                 .unwrap_or_else(|_| "1.3".to_string())
                 .parse()
                 .context("Failed to parse WEATHER_SPREAD_CORRECTION")?,
+            weather_default_bias_offset: env::var("WEATHER_DEFAULT_BIAS_OFFSET")
+                .unwrap_or_else(|_| "0.0".to_string())
+                .parse()
+                .context("Failed to parse WEATHER_DEFAULT_BIAS_OFFSET")?,
+            trading_fee_rate: env::var("TRADING_FEE_RATE")
+                .unwrap_or_else(|_| "0.02".to_string())
+                .parse()
+                .context("Failed to parse TRADING_FEE_RATE")?,
             stop_loss_pct: env::var("STOP_LOSS_PCT")
                 .unwrap_or_else(|_| "0.15".to_string())
                 .parse()
@@ -293,6 +304,7 @@ mod tests {
         assert_eq!(config.estimator_request_timeout_secs, 30);
         assert_eq!(config.estimator_max_retries, 2);
         assert_eq!(config.weather_spread_correction, 1.3);
+        assert_eq!(config.trading_fee_rate, 0.02);
         assert_eq!(config.cycle_frequency_high_secs, 600);
         assert_eq!(config.cycle_frequency_low_secs, 1800);
         assert_eq!(config.low_bankroll_threshold, 200.0);

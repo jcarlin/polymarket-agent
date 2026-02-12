@@ -470,6 +470,8 @@ mod tests {
             low_bankroll_threshold: 200.0,
             death_exit_code: 42,
             weather_spread_correction: 1.0,
+            weather_default_bias_offset: 0.0,
+            trading_fee_rate: 0.02,
             stop_loss_pct: 0.15,
             take_profit_pct: 0.90,
             min_exit_edge: 0.02,
