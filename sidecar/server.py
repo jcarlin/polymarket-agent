@@ -11,6 +11,7 @@ from polymarket_client import PolymarketClient
 from weather.nws import fetch_nws_forecast
 from weather.open_meteo import CITY_CONFIGS, fetch_ensemble
 from weather.probability_model import compute_bucket_probabilities
+from weather.wu_scraper import fetch_wu_daily_high
 
 logger = logging.getLogger("sidecar")
 
@@ -173,6 +174,76 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
         ecmwf_count=probs.ecmwf_count,
         nws_forecast_high=probs.nws_forecast_high,
         bias_correction=probs.bias_correction,
+    )
+
+
+class WeatherValidationResponse(BaseModel):
+    city: str
+    date: str
+    wu_actual_high: float | None = None
+    nws_forecast_high: float | None = None
+    ensemble_raw_mean: float | None = None
+    ensemble_corrected_mean: float | None = None
+    error_vs_wu: float | None = None
+
+
+@app.get("/weather/validation", response_model=WeatherValidationResponse)
+async def weather_validation(city: str, date: str) -> WeatherValidationResponse:
+    """Compare WU actual vs NWS forecast vs ensemble for a past date."""
+    if city not in CITY_CONFIGS:
+        raise HTTPException(status_code=404, detail=f"Unknown city: {city}")
+
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid date format: {date}. Expected YYYY-MM-DD",
+        )
+
+    config = CITY_CONFIGS[city]
+
+    # Fetch all three data sources in parallel (best-effort each)
+    wu_high: float | None = None
+    nws_high: float | None = None
+    ensemble_raw_mean: float | None = None
+    ensemble_corrected_mean: float | None = None
+
+    try:
+        wu_high = await fetch_wu_daily_high(config.icao, date)
+    except Exception as e:
+        logger.warning("WU fetch failed for %s/%s: %s", city, date, e)
+
+    try:
+        nws_high = await fetch_nws_forecast(config.lat, config.lon, date)
+    except Exception as e:
+        logger.warning("NWS fetch failed for %s/%s: %s", city, date, e)
+
+    try:
+        forecast = await fetch_ensemble(city, date)
+        if forecast and forecast.all_members:
+            import numpy as np
+
+            ensemble_raw_mean = float(np.mean(forecast.all_members))
+            probs = compute_bucket_probabilities(
+                forecast, spread_correction=WEATHER_SPREAD_CORRECTION, nws_anchor=nws_high,
+            )
+            ensemble_corrected_mean = probs.ensemble_mean
+    except Exception as e:
+        logger.warning("Ensemble fetch failed for %s/%s: %s", city, date, e)
+
+    error_vs_wu: float | None = None
+    if wu_high is not None and ensemble_corrected_mean is not None:
+        error_vs_wu = ensemble_corrected_mean - wu_high
+
+    return WeatherValidationResponse(
+        city=city,
+        date=date,
+        wu_actual_high=wu_high,
+        nws_forecast_high=nws_high,
+        ensemble_raw_mean=ensemble_raw_mean,
+        ensemble_corrected_mean=ensemble_corrected_mean,
+        error_vs_wu=error_vs_wu,
     )
 
 
