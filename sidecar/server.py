@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from polymarket_client import PolymarketClient
-from weather.open_meteo import CITY_CONFIGS, fetch_ensemble
+from weather.open_meteo import CITY_CONFIGS, fetch_ensemble, fetch_nws_for_city
 from weather.probability_model import compute_bucket_probabilities
 
 logger = logging.getLogger("sidecar")
@@ -110,6 +110,9 @@ class WeatherResponse(BaseModel):
     ensemble_std: float
     gefs_count: int
     ecmwf_count: int
+    nws_forecast_high: float | None = None
+    bias_correction: float = 0.0
+    raw_ensemble_mean: float = 0.0
 
 
 @app.get("/weather/probabilities", response_model=WeatherResponse)
@@ -137,8 +140,15 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
     if forecast is None:
         raise HTTPException(status_code=502, detail="Weather API returned no data")
 
+    # Fetch NWS bias-corrected forecast (optional — graceful None on failure)
+    nws_high = None
+    try:
+        nws_high = await fetch_nws_for_city(city, date)
+    except Exception as e:
+        logger.warning("NWS fetch failed for %s/%s: %s", city, date, e)
+
     probs = compute_bucket_probabilities(
-        forecast, spread_correction=WEATHER_SPREAD_CORRECTION
+        forecast, spread_correction=WEATHER_SPREAD_CORRECTION, nws_high=nws_high
     )
 
     return WeatherResponse(
@@ -158,6 +168,9 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
         ensemble_std=probs.ensemble_std,
         gefs_count=probs.gefs_count,
         ecmwf_count=probs.ecmwf_count,
+        nws_forecast_high=probs.nws_forecast_high,
+        bias_correction=probs.bias_correction,
+        raw_ensemble_mean=probs.raw_ensemble_mean,
     )
 
 

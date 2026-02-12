@@ -3,8 +3,6 @@
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 from typing import Optional
 
 import httpx
@@ -25,7 +23,7 @@ class CityConfig:
 
 # 20 US cities with airport ICAO codes for Weather Underground resolution
 CITY_CONFIGS: dict[str, CityConfig] = {
-    "NYC": CityConfig("New York", "KLGA", 40.7728, -73.8740, "America/New_York"),
+    "NYC": CityConfig("New York", "KLGA", 40.7772, -73.8726, "America/New_York"),
     "LAX": CityConfig("Los Angeles", "KLAX", 33.9425, -118.4081, "America/Los_Angeles"),
     "CHI": CityConfig("Chicago", "KORD", 41.9742, -87.9073, "America/Chicago"),
     "HOU": CityConfig("Houston", "KIAH", 29.9902, -95.3368, "America/Chicago"),
@@ -62,32 +60,6 @@ def _celsius_to_fahrenheit(c: float) -> float:
     return c * 9.0 / 5.0 + 32.0
 
 
-def _extract_daily_max_for_date(
-    hourly_times: list[str],
-    member_values: list[list[float]],
-    target_date: str,
-    tz: ZoneInfo,
-) -> list[float]:
-    """Extract the daily max temperature for each ensemble member on target_date in local time."""
-    daily_maxes: list[float] = []
-    for member_temps in member_values:
-        member_max: Optional[float] = None
-        for i, time_str in enumerate(hourly_times):
-            # Open-Meteo returns times in UTC as ISO 8601
-            utc_dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-            if utc_dt.tzinfo is None:
-                utc_dt = utc_dt.replace(tzinfo=ZoneInfo("UTC"))
-            local_dt = utc_dt.astimezone(tz)
-            if local_dt.strftime("%Y-%m-%d") == target_date:
-                val = member_temps[i] if i < len(member_temps) else None
-                if val is not None:
-                    if member_max is None or val > member_max:
-                        member_max = val
-        if member_max is not None:
-            daily_maxes.append(_celsius_to_fahrenheit(member_max))
-    return daily_maxes
-
-
 async def fetch_ensemble(
     city: str,
     date: str,
@@ -100,18 +72,12 @@ async def fetch_ensemble(
         logger.warning("Unknown city: %s", city)
         return None
 
-    tz = ZoneInfo(config.timezone)
-    # Request target date and next day to cover full local-day hours
-    target = datetime.strptime(date, "%Y-%m-%d")
-    end_date = (target + timedelta(days=1)).strftime("%Y-%m-%d")
-
     params = {
         "latitude": config.lat,
         "longitude": config.lon,
-        "hourly": "temperature_2m",
+        "daily": "temperature_2m_max",
         "start_date": date,
-        "end_date": end_date,
-        "timezone": "UTC",
+        "end_date": date,
     }
 
     close_session = False
@@ -144,16 +110,15 @@ async def fetch_ensemble(
                 return None
 
             data = resp.json()
-            hourly = data.get("hourly", {})
-            times = hourly.get("time", [])
+            daily = data.get("daily", {})
 
-            # Extract member columns: temperature_2m_member01, temperature_2m_member02, ...
-            member_values: list[list[float]] = []
-            for key in sorted(hourly.keys()):
-                if key.startswith("temperature_2m_member"):
-                    member_values.append(hourly[key])
-
-            daily_maxes = _extract_daily_max_for_date(times, member_values, date, tz)
+            # Extract member columns: temperature_2m_max_member01, ...
+            daily_maxes: list[float] = []
+            for key in sorted(daily.keys()):
+                if key.startswith("temperature_2m_max_member"):
+                    values = daily[key]
+                    if values and values[0] is not None:
+                        daily_maxes.append(_celsius_to_fahrenheit(values[0]))
 
             if model_name == "gefs":
                 gefs_maxes = daily_maxes
@@ -172,6 +137,117 @@ async def fetch_ensemble(
     finally:
         if close_session:
             await session.aclose()
+
+
+NWS_API_BASE = "https://api.weather.gov"
+NWS_HEADERS = {
+    "User-Agent": "polymarket-agent/1.0",
+    "Accept": "application/geo+json",
+}
+
+# Cache grid point forecast URL per (lat, lon) to avoid repeated lookups
+_nws_grid_cache: dict[tuple[float, float], str] = {}
+
+
+async def fetch_nws_forecast(
+    lat: float,
+    lon: float,
+    date: str,
+    session: Optional[httpx.AsyncClient] = None,
+    max_retries: int = 3,
+) -> Optional[float]:
+    """Fetch NWS point forecast high temperature for a given lat/lon and date.
+
+    Returns the daytime high temperature in Fahrenheit, or None on failure.
+    """
+    close_session = False
+    if session is None:
+        session = httpx.AsyncClient(timeout=30.0)
+        close_session = True
+
+    try:
+        # Step 1: Get forecast grid URL (cached)
+        cache_key = (lat, lon)
+        forecast_url = _nws_grid_cache.get(cache_key)
+
+        if forecast_url is None:
+            points_url = f"{NWS_API_BASE}/points/{lat},{lon}"
+            last_err: Optional[Exception] = None
+            for attempt in range(max_retries):
+                try:
+                    resp = await session.get(points_url, headers=NWS_HEADERS)
+                    resp.raise_for_status()
+                    points_data = resp.json()
+                    forecast_url = points_data["properties"]["forecast"]
+                    _nws_grid_cache[cache_key] = forecast_url
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1.0 * (attempt + 1))
+            else:
+                logger.warning(
+                    "NWS points lookup failed for (%s, %s) after %d retries: %s",
+                    lat, lon, max_retries, last_err,
+                )
+                return None
+
+        # Step 2: Get the forecast periods
+        last_err = None
+        forecast_data = None
+        for attempt in range(max_retries):
+            try:
+                resp = await session.get(forecast_url, headers=NWS_HEADERS)
+                resp.raise_for_status()
+                forecast_data = resp.json()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+        else:
+            logger.warning(
+                "NWS forecast fetch failed for (%s, %s) after %d retries: %s",
+                lat, lon, max_retries, last_err,
+            )
+            return None
+
+        # Step 3: Find the daytime period matching target date
+        periods = forecast_data.get("properties", {}).get("periods", [])
+        for period in periods:
+            if not period.get("isDaytime", False):
+                continue
+            start_time = period.get("startTime", "")
+            # startTime format: 2026-02-11T06:00:00-05:00
+            period_date = start_time[:10]
+            if period_date == date:
+                temp = period["temperature"]
+                unit = period.get("temperatureUnit", "F")
+                if unit == "C":
+                    return _celsius_to_fahrenheit(float(temp))
+                return float(temp)
+
+        logger.warning("NWS: no daytime period found for date %s at (%s, %s)", date, lat, lon)
+        return None
+    except Exception as e:
+        logger.warning("NWS fetch unexpected error for (%s, %s): %s", lat, lon, e)
+        return None
+    finally:
+        if close_session:
+            await session.aclose()
+
+
+async def fetch_nws_for_city(
+    city: str,
+    date: str,
+    session: Optional[httpx.AsyncClient] = None,
+) -> Optional[float]:
+    """Fetch NWS forecast high for a city by code (e.g. 'NYC'). Returns None if city unknown."""
+    config = CITY_CONFIGS.get(city)
+    if config is None:
+        logger.warning("fetch_nws_for_city: unknown city %s", city)
+        return None
+    return await fetch_nws_forecast(config.lat, config.lon, date, session=session)
 
 
 async def fetch_all_cities(

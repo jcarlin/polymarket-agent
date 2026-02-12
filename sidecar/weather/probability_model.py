@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 
@@ -27,6 +28,9 @@ class WeatherProbabilities:
     gefs_count: int = 0
     ecmwf_count: int = 0
     spread_correction: float = 1.0
+    nws_forecast_high: Optional[float] = None
+    bias_correction: float = 0.0
+    raw_ensemble_mean: float = 0.0
 
 
 def compute_bucket_probabilities(
@@ -34,6 +38,7 @@ def compute_bucket_probabilities(
     bucket_range: tuple[float, float] = (0, 130),
     bucket_width: float = 2.0,
     spread_correction: float = 1.0,
+    nws_high: Optional[float] = None,
 ) -> WeatherProbabilities:
     """Convert ensemble member temperatures to bucket probabilities using Gaussian KDE."""
     members = np.array(forecast.all_members, dtype=np.float64)
@@ -46,7 +51,16 @@ def compute_bucket_probabilities(
             forecast_date=forecast.forecast_date,
         )
 
-    mean = float(np.mean(members))
+    raw_mean = float(np.mean(members))
+
+    # NWS bias correction: shift ensemble to anchor on calibrated forecast
+    bias_correction = 0.0
+    if nws_high is not None:
+        bias_correction = nws_high - raw_mean
+        members = members + bias_correction
+        logger.info("NWS bias correction: shift=%.1f°F (raw_mean=%.1f, nws=%.1f)", bias_correction, raw_mean, nws_high)
+
+    mean = float(np.mean(members))  # corrected mean
     std = float(np.std(members)) if len(members) > 1 else 0.0
 
     # Apply spread correction: corrected = mean + (val - mean) * factor
@@ -105,6 +119,9 @@ def compute_bucket_probabilities(
         gefs_count=len(forecast.gefs_daily_max),
         ecmwf_count=len(forecast.ecmwf_daily_max),
         spread_correction=spread_correction,
+        nws_forecast_high=nws_high,
+        bias_correction=bias_correction,
+        raw_ensemble_mean=raw_mean,
     )
 
 

@@ -140,3 +140,34 @@ def test_histogram_fallback_with_few_members():
     assert len(nonzero) > 0
     total = sum(b.probability for b in result.buckets)
     assert abs(total - 1.0) < 0.01
+
+
+def test_nws_bias_correction():
+    """NWS bias correction should shift ensemble mean to match NWS forecast."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(30.0, 3.0, 82))
+    forecast = _make_forecast(members)
+    result = compute_bucket_probabilities(forecast, nws_high=37.0)
+    assert abs(result.ensemble_mean - 37.0) < 0.5, (
+        f"Corrected ensemble_mean {result.ensemble_mean} should be ~37.0"
+    )
+    assert abs(result.bias_correction - 7.0) < 0.5, (
+        f"bias_correction {result.bias_correction} should be ~7.0"
+    )
+    assert abs(result.raw_ensemble_mean - 30.0) < 0.5, (
+        f"raw_ensemble_mean {result.raw_ensemble_mean} should be ~30.0"
+    )
+    assert result.nws_forecast_high == 37.0
+
+
+def test_nws_none_no_shift():
+    """When nws_high is None, no bias correction should be applied."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(30.0, 3.0, 82))
+    forecast = _make_forecast(members)
+    result = compute_bucket_probabilities(forecast, nws_high=None)
+    assert result.bias_correction == 0.0
+    assert result.nws_forecast_high is None
+    assert abs(result.ensemble_mean - result.raw_ensemble_mean) < 1e-9, (
+        "ensemble_mean should equal raw_ensemble_mean when no NWS correction"
+    )

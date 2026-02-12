@@ -5,9 +5,9 @@ from weather.open_meteo import (
     CITY_CONFIGS,
     EnsembleForecast,
     _celsius_to_fahrenheit,
-    _extract_daily_max_for_date,
     fetch_ensemble,
     fetch_all_cities,
+    fetch_nws_for_city,
 )
 from zoneinfo import ZoneInfo
 
@@ -32,38 +32,6 @@ def test_celsius_to_fahrenheit():
     assert abs(_celsius_to_fahrenheit(0.0) - 32.0) < 0.01
     assert abs(_celsius_to_fahrenheit(100.0) - 212.0) < 0.01
     assert abs(_celsius_to_fahrenheit(20.0) - 68.0) < 0.01
-
-
-def test_extract_daily_max_simple():
-    """Test extraction of daily max from hourly data."""
-    times = [
-        "2026-01-15T12:00",
-        "2026-01-15T13:00",
-        "2026-01-15T14:00",
-        "2026-01-15T15:00",
-    ]
-    # One member with temps 20, 25, 22, 18
-    member_values = [[20.0, 25.0, 22.0, 18.0]]
-    tz = ZoneInfo("America/New_York")
-    maxes = _extract_daily_max_for_date(times, member_values, "2026-01-15", tz)
-    # Max is 25C = 77F
-    assert len(maxes) == 1
-    assert abs(maxes[0] - 77.0) < 0.1
-
-
-def test_extract_daily_max_filters_by_date():
-    """Only hours matching target_date in local time should be included."""
-    times = [
-        "2026-01-15T23:00",  # Jan 15 in UTC, but could be Jan 15 or 16 local
-        "2026-01-16T05:00",  # Jan 16 UTC = Jan 16 local for NYC (EST = UTC-5)
-    ]
-    member_values = [[30.0, 10.0]]  # 30C on Jan 15, 10C on Jan 16 (UTC)
-    tz = ZoneInfo("America/New_York")
-    # For NYC (UTC-5), 23:00 UTC = 18:00 EST Jan 15, 05:00 UTC = 00:00 EST Jan 16
-    maxes = _extract_daily_max_for_date(times, member_values, "2026-01-15", tz)
-    assert len(maxes) == 1
-    # Should only get the 30C reading (18:00 EST Jan 15)
-    assert abs(maxes[0] - _celsius_to_fahrenheit(30.0)) < 0.1
 
 
 @pytest.mark.asyncio
@@ -92,3 +60,10 @@ async def test_fetch_all_cities_empty_list():
     """Fetching with empty city list should return empty dict."""
     result = await fetch_all_cities("2026-01-15", cities=[])
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_nws_for_city_unknown():
+    """Unknown city should return None."""
+    result = await fetch_nws_for_city("UNKNOWN", "2026-01-15")
+    assert result is None
