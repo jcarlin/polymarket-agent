@@ -26,11 +26,13 @@ class WeatherProbabilities:
     ensemble_std: float = 0.0
     gefs_count: int = 0
     ecmwf_count: int = 0
+    gem_count: int = 0
+    icon_count: int = 0
     spread_correction: float = 1.0
     nws_forecast_high: float | None = None
     bias_correction: float | None = None
     nbm_p50: float | None = None
-    anchor_source: str = "raw"  # "nbm", "nws", or "raw"
+    anchor_source: str = "raw"  # "hrrr", "nbm", "nws", or "raw"
 
 
 def compute_bucket_probabilities(
@@ -142,6 +144,9 @@ def compute_bucket_probabilities(
     # Filter to only buckets with non-negligible probability
     significant_buckets = [b for b in buckets if b.probability > 1e-6]
 
+    gem_count = len(forecast.gem_daily_max) if hasattr(forecast, "gem_daily_max") else 0
+    icon_count = len(forecast.icon_daily_max) if hasattr(forecast, "icon_daily_max") else 0
+
     return WeatherProbabilities(
         city=forecast.city,
         station_icao=forecast.station_icao,
@@ -151,6 +156,8 @@ def compute_bucket_probabilities(
         ensemble_std=std,
         gefs_count=len(forecast.gefs_daily_max),
         ecmwf_count=len(forecast.ecmwf_daily_max),
+        gem_count=gem_count,
+        icon_count=icon_count,
         spread_correction=effective_spread,
         nws_forecast_high=nws_anchor,
         bias_correction=bias_correction,

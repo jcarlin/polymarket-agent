@@ -114,6 +114,8 @@ class WeatherResponse(BaseModel):
     ensemble_std: float
     gefs_count: int
     ecmwf_count: int
+    gem_count: int = 0
+    icon_count: int = 0
     nws_forecast_high: float | None = None
     bias_correction: float | None = None
     nbm_p50: float | None = None
@@ -214,6 +216,8 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
         ensemble_std=probs.ensemble_std,
         gefs_count=probs.gefs_count,
         ecmwf_count=probs.ecmwf_count,
+        gem_count=probs.gem_count,
+        icon_count=probs.icon_count,
         nws_forecast_high=probs.nws_forecast_high,
         bias_correction=probs.bias_correction,
         nbm_p50=probs.nbm_p50,

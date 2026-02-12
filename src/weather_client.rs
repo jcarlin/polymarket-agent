@@ -87,6 +87,12 @@ pub struct WeatherProbabilities {
     pub ensemble_std: f64,
     pub gefs_count: u32,
     pub ecmwf_count: u32,
+    /// Canadian GEM ensemble member count
+    #[serde(default)]
+    pub gem_count: Option<u32>,
+    /// DWD ICON-EPS ensemble member count
+    #[serde(default)]
+    pub icon_count: Option<u32>,
     /// NWS official forecast high temperature used as bias-correction anchor
     #[serde(default)]
     pub nws_forecast_high: Option<f64>,
@@ -622,6 +628,8 @@ mod tests {
             ecmwf_count: 51,
             nws_forecast_high: None,
             bias_correction: None,
+            gem_count: None,
+            icon_count: None,
             nbm_p50: None,
             anchor_source: None,
         };
@@ -670,6 +678,8 @@ mod tests {
             ecmwf_count: 51,
             nws_forecast_high: None,
             bias_correction: None,
+            gem_count: None,
+            icon_count: None,
             nbm_p50: None,
             anchor_source: None,
         };

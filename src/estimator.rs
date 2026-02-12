@@ -741,6 +741,8 @@ mod tests {
             ensemble_std: 2.3,
             gefs_count: 31,
             ecmwf_count: 51,
+            gem_count: None,
+            icon_count: None,
             nws_forecast_high: None,
             bias_correction: None,
             nbm_p50: None,
