@@ -391,6 +391,18 @@ impl Estimator {
                 ));
             }
         }
+        if let Some(nws_high) = wx.probs.nws_forecast_high {
+            block.push_str(&format!(
+                "- **NWS Official Forecast High:** {:.0}°F\n",
+                nws_high
+            ));
+        }
+        if let Some(bias) = wx.probs.bias_correction {
+            block.push_str(&format!(
+                "- **Bias Correction Applied:** {:+.1}°F (ensemble shifted to match NWS)\n",
+                bias
+            ));
+        }
         if let Some(mp) = wx.model_probability {
             block.push_str(&format!(
                 "- **Model probability for this outcome:** {:.1}%\n",
@@ -729,6 +741,8 @@ mod tests {
             ensemble_std: 2.3,
             gefs_count: 31,
             ecmwf_count: 51,
+            nws_forecast_high: None,
+            bias_correction: None,
         };
         let wx = WeatherContext {
             probs: &weather_probs,

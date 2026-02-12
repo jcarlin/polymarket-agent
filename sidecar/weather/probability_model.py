@@ -27,6 +27,8 @@ class WeatherProbabilities:
     gefs_count: int = 0
     ecmwf_count: int = 0
     spread_correction: float = 1.0
+    nws_forecast_high: float | None = None
+    bias_correction: float | None = None
 
 
 def compute_bucket_probabilities(
@@ -34,8 +36,19 @@ def compute_bucket_probabilities(
     bucket_range: tuple[float, float] = (0, 130),
     bucket_width: float = 2.0,
     spread_correction: float = 1.0,
+    nws_anchor: float | None = None,
 ) -> WeatherProbabilities:
-    """Convert ensemble member temperatures to bucket probabilities using Gaussian KDE."""
+    """Convert ensemble member temperatures to bucket probabilities using Gaussian KDE.
+
+    Args:
+        forecast: EnsembleForecast with all_members temperatures
+        bucket_range: Min/max temperature range for buckets
+        bucket_width: Width of each bucket in °F
+        spread_correction: Multiplicative spread adjustment (>1 widens, <1 narrows)
+        nws_anchor: NWS official forecast high in °F. If provided, shifts the entire
+            ensemble distribution to center on this value before applying spread
+            correction and KDE. Fixes the ~5°F cold bias in raw ensemble output.
+    """
     members = np.array(forecast.all_members, dtype=np.float64)
 
     if len(members) == 0:
@@ -46,12 +59,24 @@ def compute_bucket_probabilities(
             forecast_date=forecast.forecast_date,
         )
 
-    mean = float(np.mean(members))
+    raw_mean = float(np.mean(members))
     std = float(np.std(members)) if len(members) > 1 else 0.0
 
-    # Apply spread correction: corrected = mean + (val - mean) * factor
+    # Step 1: Apply NWS anchor bias correction (shift mean to match NWS forecast)
+    bias_correction: float | None = None
+    if nws_anchor is not None:
+        bias_correction = nws_anchor - raw_mean
+        members = members + bias_correction
+        logger.info(
+            "Applied NWS anchor for %s: raw_mean=%.1f, nws=%.1f, shift=%+.1f",
+            forecast.city, raw_mean, nws_anchor, bias_correction,
+        )
+
+    corrected_mean = float(np.mean(members))
+
+    # Step 2: Apply spread correction: corrected = mean + (val - mean) * factor
     if spread_correction != 1.0:
-        corrected = mean + (members - mean) * spread_correction
+        corrected = corrected_mean + (members - corrected_mean) * spread_correction
     else:
         corrected = members
 
@@ -100,11 +125,13 @@ def compute_bucket_probabilities(
         station_icao=forecast.station_icao,
         forecast_date=forecast.forecast_date,
         buckets=significant_buckets,
-        ensemble_mean=mean,
+        ensemble_mean=corrected_mean,
         ensemble_std=std,
         gefs_count=len(forecast.gefs_daily_max),
         ecmwf_count=len(forecast.ecmwf_daily_max),
         spread_correction=spread_correction,
+        nws_forecast_high=nws_anchor,
+        bias_correction=bias_correction,
     )
 
 

@@ -140,3 +140,78 @@ def test_histogram_fallback_with_few_members():
     assert len(nonzero) > 0
     total = sum(b.probability for b in result.buckets)
     assert abs(total - 1.0) < 0.01
+
+
+def test_nws_anchor_shifts_mean():
+    """NWS anchor should shift ensemble mean to match the anchor value."""
+    # Members centered around 32°F (raw cold bias)
+    members = [30.0 + i * 0.2 for i in range(82)]  # ~32°F mean
+    forecast = _make_forecast(members)
+    raw_mean = np.mean(members)
+
+    # Anchor to NWS forecast of 37°F
+    result = compute_bucket_probabilities(forecast, nws_anchor=37.0)
+
+    # Mean should now be close to 37, not 32
+    assert abs(result.ensemble_mean - 37.0) < 0.5, (
+        f"Expected mean ~37.0 after NWS anchor, got {result.ensemble_mean}"
+    )
+    assert result.nws_forecast_high == 37.0
+    assert result.bias_correction is not None
+    assert abs(result.bias_correction - (37.0 - raw_mean)) < 0.1
+
+
+def test_nws_anchor_preserves_spread():
+    """NWS anchor should preserve ensemble spread (only shift, not scale)."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(32, 3, 82))
+    forecast = _make_forecast(members)
+
+    result_raw = compute_bucket_probabilities(forecast)
+    result_anchored = compute_bucket_probabilities(forecast, nws_anchor=37.0)
+
+    # Std dev should be identical (shift doesn't change spread)
+    assert abs(result_raw.ensemble_std - result_anchored.ensemble_std) < 0.01
+
+
+def test_nws_anchor_none_no_shift():
+    """When nws_anchor is None, no shift should be applied."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(75, 3, 82))
+    forecast = _make_forecast(members)
+
+    result = compute_bucket_probabilities(forecast, nws_anchor=None)
+    assert result.nws_forecast_high is None
+    assert result.bias_correction is None
+    assert abs(result.ensemble_mean - np.mean(members)) < 0.1
+
+
+def test_nws_anchor_with_spread_correction():
+    """NWS anchor and spread correction should compose correctly."""
+    members = [30.0 + i * 0.2 for i in range(82)]  # ~32°F mean, tight
+    forecast = _make_forecast(members)
+
+    # Apply both: shift to 37°F AND widen spread by 1.3x
+    result = compute_bucket_probabilities(
+        forecast, spread_correction=1.3, nws_anchor=37.0
+    )
+
+    # Mean should be near 37
+    assert abs(result.ensemble_mean - 37.0) < 0.5
+    # Probabilities should still sum to ~1
+    total = sum(b.probability for b in result.buckets)
+    assert abs(total - 1.0) < 0.01
+    # NWS fields should be populated
+    assert result.nws_forecast_high == 37.0
+    assert result.bias_correction is not None
+
+
+def test_nws_anchor_probabilities_sum_to_one():
+    """After NWS anchor shift, probabilities should still sum to ~1.0."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(30, 4, 82))
+    forecast = _make_forecast(members)
+
+    result = compute_bucket_probabilities(forecast, nws_anchor=45.0)
+    total = sum(b.probability for b in result.buckets)
+    assert abs(total - 1.0) < 0.01, f"Total probability {total} should be ~1.0"
