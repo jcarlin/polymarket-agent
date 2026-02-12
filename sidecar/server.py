@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from polymarket_client import PolymarketClient
+from weather.nbm import fetch_nbm_percentiles, is_available as nbm_is_available, nbm_anchor_and_spread
 from weather.nws import fetch_nws_forecast
 from weather.open_meteo import CITY_CONFIGS, fetch_ensemble
 from weather.probability_model import compute_bucket_probabilities
@@ -114,6 +115,8 @@ class WeatherResponse(BaseModel):
     ecmwf_count: int
     nws_forecast_high: float | None = None
     bias_correction: float | None = None
+    nbm_p50: float | None = None
+    anchor_source: str = "raw"
 
 
 @app.get("/weather/probabilities", response_model=WeatherResponse)
@@ -141,9 +144,27 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
     if forecast is None:
         raise HTTPException(status_code=502, detail="Weather API returned no data")
 
-    # Fetch NWS bias-corrected forecast as anchor (best-effort, non-blocking)
     config = CITY_CONFIGS[city]
+
+    # Fallback chain for anchor: NBM (best) → NWS → raw ensemble
     nws_high: float | None = None
+    nbm_anchor_val: float | None = None
+    nbm_spread_val: float | None = None
+
+    # Try NBM first (gold standard, calibrated percentiles)
+    if nbm_is_available():
+        try:
+            import numpy as np
+
+            raw_std = float(np.std(forecast.all_members)) if len(forecast.all_members) > 1 else 0.0
+            nbm_data = fetch_nbm_percentiles(config.lat, config.lon, date)
+            if nbm_data is not None:
+                nbm_anchor_val, nbm_spread_val = nbm_anchor_and_spread(nbm_data, raw_std)
+                logger.info("NBM anchor for %s: p50=%.1f, spread=%.2f", city, nbm_anchor_val, nbm_spread_val)
+        except Exception as e:
+            logger.warning("NBM fetch failed for %s/%s (falling back to NWS): %s", city, date, e)
+
+    # Fetch NWS as fallback anchor (best-effort, non-blocking)
     try:
         nws_high = await fetch_nws_forecast(config.lat, config.lon, date)
     except Exception as e:
@@ -153,6 +174,8 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
         forecast,
         spread_correction=WEATHER_SPREAD_CORRECTION,
         nws_anchor=nws_high,
+        nbm_anchor=nbm_anchor_val,
+        nbm_spread=nbm_spread_val,
     )
 
     return WeatherResponse(
@@ -174,6 +197,8 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
         ecmwf_count=probs.ecmwf_count,
         nws_forecast_high=probs.nws_forecast_high,
         bias_correction=probs.bias_correction,
+        nbm_p50=probs.nbm_p50,
+        anchor_source=probs.anchor_source,
     )
 
 

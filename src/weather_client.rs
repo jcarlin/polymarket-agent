@@ -90,9 +90,15 @@ pub struct WeatherProbabilities {
     /// NWS official forecast high temperature used as bias-correction anchor
     #[serde(default)]
     pub nws_forecast_high: Option<f64>,
-    /// Bias correction applied (ensemble shifted by this many °F to match NWS)
+    /// Bias correction applied (ensemble shifted by this many °F to match anchor)
     #[serde(default)]
     pub bias_correction: Option<f64>,
+    /// NBM median (p50) temperature if available
+    #[serde(default)]
+    pub nbm_p50: Option<f64>,
+    /// Which anchor source was used: "nbm", "nws", or "raw"
+    #[serde(default)]
+    pub anchor_source: Option<String>,
 }
 
 /// Parsed weather market info from Polymarket question text
@@ -616,6 +622,8 @@ mod tests {
             ecmwf_count: 51,
             nws_forecast_high: None,
             bias_correction: None,
+            nbm_p50: None,
+            anchor_source: None,
         };
 
         let info = WeatherMarketInfo {
@@ -662,6 +670,8 @@ mod tests {
             ecmwf_count: 51,
             nws_forecast_high: None,
             bias_correction: None,
+            nbm_p50: None,
+            anchor_source: None,
         };
 
         let info = WeatherMarketInfo {

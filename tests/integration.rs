@@ -250,6 +250,8 @@ fn test_weather_market_parsing_and_bucket_lookup() {
         ecmwf_count: 51,
         nws_forecast_high: None,
         bias_correction: None,
+        nbm_p50: None,
+        anchor_source: None,
     };
 
     let prob = get_weather_model_probability(&info, &probs).unwrap();

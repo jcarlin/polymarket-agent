@@ -743,6 +743,8 @@ mod tests {
             ecmwf_count: 51,
             nws_forecast_high: None,
             bias_correction: None,
+            nbm_p50: None,
+            anchor_source: None,
         };
         let wx = WeatherContext {
             probs: &weather_probs,
