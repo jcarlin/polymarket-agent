@@ -1,10 +1,16 @@
 use anyhow::{Context, Result};
+use chrono::{Duration as ChronoDuration, Utc};
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::config::Config;
+
+/// Gamma API tag ID for weather/temperature events.
+/// Discovered via live API: `GET /events?tag_id=84&closed=false` returns all
+/// city temperature markets. Previous value 100381 was incorrect/stale.
+const WEATHER_TAG_ID: u32 = 84;
 
 // Custom deserializer for fields that may be strings or numbers or null
 fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -34,28 +40,147 @@ where
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Deserialize `id` that may be a string or a number.
+fn deserialize_string_or_u64<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrNum {
+        Num(u64),
+        Str(String),
+    }
+
+    match StringOrNum::deserialize(deserializer)? {
+        StringOrNum::Num(n) => Ok(n.to_string()),
+        StringOrNum::Str(s) => Ok(s),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct GammaMarket {
-    pub id: u64,
+    pub id: String,
     pub question: String,
-    #[serde(default)]
     pub slug: Option<String>,
-    #[serde(rename = "conditionId", default)]
     pub condition_id: Option<String>,
-    #[serde(default)]
     pub tokens: Vec<Token>,
-    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub volume: Option<f64>,
-    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub liquidity: Option<f64>,
-    #[serde(rename = "endDate", default)]
     pub end_date: Option<String>,
-    #[serde(default)]
     pub closed: bool,
-    #[serde(default)]
     pub active: bool,
-    #[serde(default)]
     pub tags: Vec<Tag>,
+}
+
+/// Raw API response — tokens are spread across three stringified JSON arrays.
+#[derive(Deserialize)]
+struct RawGammaMarket {
+    #[serde(deserialize_with = "deserialize_string_or_u64")]
+    id: String,
+    question: String,
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(rename = "conditionId", default)]
+    condition_id: Option<String>,
+    /// Legacy format: some mock/test responses include tokens directly.
+    #[serde(default)]
+    tokens: Vec<Token>,
+    /// Real API: stringified JSON array of CLOB token IDs.
+    #[serde(rename = "clobTokenIds", default)]
+    clob_token_ids: Option<String>,
+    /// Real API: stringified JSON array like `["Yes","No"]`.
+    #[serde(default)]
+    outcomes: Option<String>,
+    /// Real API: stringified JSON array like `["0.65","0.35"]`.
+    #[serde(rename = "outcomePrices", default)]
+    outcome_prices: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
+    volume: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
+    liquidity: Option<f64>,
+    #[serde(rename = "endDate", default)]
+    end_date: Option<String>,
+    #[serde(default)]
+    closed: bool,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    tags: Vec<Tag>,
+}
+
+impl From<RawGammaMarket> for GammaMarket {
+    fn from(raw: RawGammaMarket) -> Self {
+        // If the legacy `tokens` array is populated, use it directly.
+        // Otherwise, build tokens from the three stringified JSON fields.
+        let tokens = if !raw.tokens.is_empty() {
+            raw.tokens
+        } else {
+            build_tokens_from_strings(
+                raw.clob_token_ids.as_deref(),
+                raw.outcomes.as_deref(),
+                raw.outcome_prices.as_deref(),
+            )
+        };
+
+        GammaMarket {
+            id: raw.id,
+            question: raw.question,
+            slug: raw.slug,
+            condition_id: raw.condition_id,
+            tokens,
+            volume: raw.volume,
+            liquidity: raw.liquidity,
+            end_date: raw.end_date,
+            closed: raw.closed,
+            active: raw.active,
+            tags: raw.tags,
+        }
+    }
+}
+
+/// Parse the three stringified JSON arrays into a Vec<Token>.
+fn build_tokens_from_strings(
+    clob_token_ids: Option<&str>,
+    outcomes: Option<&str>,
+    outcome_prices: Option<&str>,
+) -> Vec<Token> {
+    let ids: Vec<String> = clob_token_ids
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let outs: Vec<String> = outcomes
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let prices: Vec<String> = outcome_prices
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    if ids.len() != outs.len() {
+        return Vec::new();
+    }
+
+    ids.into_iter()
+        .zip(outs)
+        .enumerate()
+        .map(|(i, (token_id, outcome))| {
+            let price = prices.get(i).and_then(|p| p.parse::<f64>().ok());
+            Token {
+                token_id,
+                outcome,
+                price,
+            }
+        })
+        .collect()
+}
+
+impl<'de> Deserialize<'de> for GammaMarket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawGammaMarket::deserialize(deserializer)?;
+        Ok(GammaMarket::from(raw))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +197,17 @@ pub struct Tag {
     pub id: Option<u64>,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// A Gamma API event response containing child markets.
+#[derive(Debug, Deserialize)]
+struct GammaEvent {
+    #[allow(dead_code)]
+    id: serde_json::Value,
+    #[allow(dead_code)]
+    slug: Option<String>,
+    #[serde(default)]
+    markets: Vec<GammaMarket>,
 }
 
 pub struct MarketScanner {
@@ -212,6 +348,82 @@ impl MarketScanner {
         filtered
     }
 
+    /// Fetch all weather temperature markets using a single tag-based query.
+    ///
+    /// Makes one request: `GET /events?tag_id=84&closed=false&limit=100`
+    /// then filters client-side by supported city codes and date window.
+    pub async fn scan_weather_events(
+        &self,
+        city_codes: &[&str],
+        days_ahead: u32,
+    ) -> Result<Vec<GammaMarket>> {
+        let url = format!("{}/events", self.gamma_url);
+        let tag_id_str = WEATHER_TAG_ID.to_string();
+
+        let response = self
+            .client
+            .get(&url)
+            .query(&[
+                ("tag_id", tag_id_str.as_str()),
+                ("closed", "false"),
+                ("limit", "200"),
+            ])
+            .send()
+            .await
+            .context("Failed to fetch weather events by tag")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Gamma API weather tag query returned {}: {}", status, body);
+        }
+
+        let events: Vec<GammaEvent> = response
+            .json()
+            .await
+            .context("Failed to parse weather events response")?;
+
+        // Extract all child markets from the events
+        let all_markets: Vec<GammaMarket> = events
+            .into_iter()
+            .flat_map(|e| e.markets)
+            .collect();
+
+        // Filter to supported cities and date window using parse_weather_market
+        let today = Utc::now().date_naive();
+        let max_date = today + ChronoDuration::days(days_ahead as i64);
+
+        let filtered: Vec<GammaMarket> = all_markets
+            .into_iter()
+            .filter(|m| {
+                if let Some(info) = crate::weather_client::parse_weather_market(&m.question) {
+                    // Check city is in our supported list
+                    if !city_codes.contains(&info.city.as_str()) {
+                        return false;
+                    }
+                    // Check date is within window
+                    if let Ok(market_date) = chrono::NaiveDate::parse_from_str(&info.date, "%Y-%m-%d") {
+                        market_date >= today && market_date < max_date
+                    } else {
+                        false
+                    }
+                } else {
+                    false // Not a parseable temperature market
+                }
+            })
+            .collect();
+
+        info!(
+            "Weather scan: fetched events via tag_id={}, found {} markets for {} cities within {} days",
+            WEATHER_TAG_ID,
+            filtered.len(),
+            city_codes.len(),
+            days_ahead,
+        );
+
+        Ok(filtered)
+    }
+
     pub async fn scan_and_filter(&self) -> Result<Vec<GammaMarket>> {
         let markets = self.scan_all().await?;
         Ok(self.filter_markets(markets))
@@ -239,6 +451,7 @@ mod tests {
             scanner_min_liquidity: 500.0,
             scanner_min_volume: 1000.0,
             scanner_request_timeout_secs: 5,
+            scanner_weather_only: false,
             database_path: ":memory:".to_string(),
             anthropic_api_key: "test-key".to_string(),
             anthropic_api_url: String::new(),
@@ -266,7 +479,13 @@ mod tests {
             volume_spike_factor: 3.0,
             whale_move_threshold: 5000.0,
             max_correlated_exposure_pct: 0.15,
+            max_total_weather_exposure_pct: 0.25,
+            weather_daily_loss_limit: 10.0,
             position_check_enabled: true,
+            dashboard_port: 8080,
+            dashboard_user: "admin".to_string(),
+            dashboard_password: String::new(),
+            max_cycles: None,
         }
     }
 
@@ -285,7 +504,7 @@ mod tests {
             "endDate": "2026-03-01T00:00:00Z",
             "closed": closed,
             "active": !closed,
-            "tags": [{"id": 100381, "label": "Weather"}]
+            "tags": [{"id": 84, "label": "Weather"}]
         })
     }
 
@@ -311,8 +530,8 @@ mod tests {
 
         let markets = scanner.fetch_page(0).await.unwrap();
         assert_eq!(markets.len(), 2);
-        assert_eq!(markets[0].id, 1);
-        assert_eq!(markets[1].id, 2);
+        assert_eq!(markets[0].id, "1");
+        assert_eq!(markets[1].id, "2");
     }
 
     #[tokio::test]
@@ -376,7 +595,7 @@ mod tests {
 
         let filtered = scanner.filter_markets(markets);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, 1);
+        assert_eq!(filtered[0].id, "1");
     }
 
     #[tokio::test]
@@ -392,7 +611,7 @@ mod tests {
 
         let filtered = scanner.filter_markets(markets);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, 1);
+        assert_eq!(filtered[0].id, "1");
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ Direct market listing with filtering.
 curl "https://gamma-api.polymarket.com/markets?closed=false&limit=50&offset=0"
 
 # Filter by tag (e.g., weather)
-curl "https://gamma-api.polymarket.com/markets?tag_id=100381&closed=false&limit=25&offset=0"
+curl "https://gamma-api.polymarket.com/markets?tag_id=84&closed=false&limit=25&offset=0"
 ```
 
 **Key response fields per market:**
@@ -69,7 +69,7 @@ curl "https://gamma-api.polymarket.com/markets?tag_id=100381&closed=false&limit=
   "endDate": "2026-02-11T00:00:00Z",
   "closed": false,
   "active": true,
-  "tags": [{ "id": 100381, "label": "Weather" }]
+  "tags": [{ "id": 84, "label": "Weather" }]
 }
 ```
 

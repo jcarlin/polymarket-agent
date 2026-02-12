@@ -53,11 +53,25 @@ impl PositionSizer {
     ///   adjusted  = kelly * kelly_fraction (half-Kelly)
     ///   position  = min(adjusted * bankroll, max_position_pct * bankroll, remaining_exposure)
     ///   shares    = position / buy_price
+    ///
+    /// `days_until_resolution`: if Some, applies a time-based multiplier for weather markets.
+    ///   1-2 days: 1.0x, 3-4 days: 0.7x, 5-7 days: 0.4x, >7 days: 0.2x
     pub fn size_position(
         &self,
         opp: &EdgeOpportunity,
         bankroll: f64,
         current_exposure: f64,
+    ) -> SizingResult {
+        self.size_position_with_time(opp, bankroll, current_exposure, None)
+    }
+
+    /// Size a position with optional time-based multiplier for weather markets.
+    pub fn size_position_with_time(
+        &self,
+        opp: &EdgeOpportunity,
+        bankroll: f64,
+        current_exposure: f64,
+        days_until_resolution: Option<i64>,
     ) -> SizingResult {
         // Determine buy price and win probability based on side
         let (buy_price, win_prob) = match opp.side {
@@ -77,7 +91,24 @@ impl PositionSizer {
             return SizingResult::rejected("negative Kelly — no edge");
         }
 
-        let adjusted_kelly = raw_kelly * self.kelly_fraction;
+        let mut adjusted_kelly = raw_kelly * self.kelly_fraction;
+
+        // Time-based multiplier for weather markets
+        if let Some(days) = days_until_resolution {
+            let time_multiplier = match days {
+                0..=2 => 1.0,
+                3..=4 => 0.7,
+                5..=7 => 0.4,
+                _ => 0.2,
+            };
+            if time_multiplier < 1.0 {
+                info!(
+                    "Weather time multiplier: {:.1}x ({}d until resolution)",
+                    time_multiplier, days,
+                );
+            }
+            adjusted_kelly *= time_multiplier;
+        }
 
         // Position caps
         let max_exposure = self.max_total_exposure_pct * bankroll;
@@ -258,5 +289,38 @@ mod tests {
         let opp = make_opportunity(TradeSide::Yes, 0.75, 0.55, 0.20);
         let result = sizer.size_position(&opp, 0.0, 0.0);
         assert!(result.is_rejected());
+    }
+
+    #[test]
+    fn test_time_based_sizing() {
+        let sizer = PositionSizer::new(0.5, 1.0, 1.0); // no caps for clarity
+        let opp = make_opportunity(TradeSide::Yes, 0.80, 0.50, 0.30);
+        // kelly = (0.80 - 0.50) / (1 - 0.50) = 0.60, adjusted = 0.30
+        // position = 0.30 * 100 = 30.0
+
+        // 2-day market: 1.0x → $30.0
+        let r2 = sizer.size_position_with_time(&opp, 100.0, 0.0, Some(2));
+        assert!(!r2.is_rejected());
+        assert!((r2.position_usd - 30.0).abs() < 0.01);
+
+        // 3-day market: 0.7x → $21.0
+        let r3 = sizer.size_position_with_time(&opp, 100.0, 0.0, Some(3));
+        assert!(!r3.is_rejected());
+        assert!((r3.position_usd - 21.0).abs() < 0.01);
+
+        // 6-day market: 0.4x → $12.0
+        let r6 = sizer.size_position_with_time(&opp, 100.0, 0.0, Some(6));
+        assert!(!r6.is_rejected());
+        assert!((r6.position_usd - 12.0).abs() < 0.01);
+
+        // 10-day market: 0.2x → $6.0
+        let r10 = sizer.size_position_with_time(&opp, 100.0, 0.0, Some(10));
+        assert!(!r10.is_rejected());
+        assert!((r10.position_usd - 6.0).abs() < 0.01);
+
+        // None (non-weather): same as no multiplier → $30.0
+        let rn = sizer.size_position_with_time(&opp, 100.0, 0.0, None);
+        assert!(!rn.is_rejected());
+        assert!((rn.position_usd - 30.0).abs() < 0.01);
     }
 }

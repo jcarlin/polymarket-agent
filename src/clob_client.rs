@@ -97,11 +97,15 @@ impl ClobClient {
     /// Fetch all price data for a token (midpoint + bid + ask).
     /// Graceful degradation: if bid/ask fail, uses midpoint only.
     pub async fn get_market_prices(&self, token_id: &str, outcome: &str) -> Result<MarketPrices> {
-        let midpoint = self.get_midpoint(token_id).await?;
-
-        // Try to get bid/ask, but don't fail if they're unavailable
-        let bid = self.get_price(token_id, "BUY").await.ok();
-        let ask = self.get_price(token_id, "SELL").await.ok();
+        // Fetch midpoint, bid, and ask concurrently (3 independent calls)
+        let (mid_result, bid_result, ask_result) = tokio::join!(
+            self.get_midpoint(token_id),
+            self.get_price(token_id, "BUY"),
+            self.get_price(token_id, "SELL"),
+        );
+        let midpoint = mid_result?;
+        let bid = bid_result.ok();
+        let ask = ask_result.ok();
         let spread = match (bid, ask) {
             (Some(b), Some(a)) => Some(a - b),
             _ => None,

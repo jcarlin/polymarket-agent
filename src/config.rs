@@ -46,6 +46,7 @@ pub struct Config {
     pub scanner_min_liquidity: f64,
     pub scanner_min_volume: f64,
     pub scanner_request_timeout_secs: u64,
+    pub scanner_weather_only: bool,
     // Database
     pub database_path: String,
     // Claude API
@@ -74,12 +75,19 @@ pub struct Config {
     pub volume_spike_factor: f64,
     pub whale_move_threshold: f64,
     pub max_correlated_exposure_pct: f64,
+    pub max_total_weather_exposure_pct: f64,
+    pub weather_daily_loss_limit: f64,
     pub position_check_enabled: bool,
+    // Dashboard (Phase 7)
+    pub dashboard_port: u16,
+    pub dashboard_user: String,
+    pub dashboard_password: String,
     // Cycle & survival (Phase 4)
     pub cycle_frequency_high_secs: u64,
     pub cycle_frequency_low_secs: u64,
     pub low_bankroll_threshold: f64,
     pub death_exit_code: i32,
+    pub max_cycles: Option<u64>,
 }
 
 impl Config {
@@ -130,6 +138,10 @@ impl Config {
                 .unwrap_or_else(|_| "15".to_string())
                 .parse()
                 .context("Failed to parse SCANNER_REQUEST_TIMEOUT_SECS")?,
+            scanner_weather_only: env::var("SCANNER_WEATHER_ONLY")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()
+                .context("Failed to parse SCANNER_WEATHER_ONLY")?,
             database_path: env::var("DATABASE_PATH")
                 .unwrap_or_else(|_| "data/polymarket-agent.db".to_string()),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY").unwrap_or_default(),
@@ -208,13 +220,27 @@ impl Config {
                 .parse()
                 .context("Failed to parse WHALE_MOVE_THRESHOLD")?,
             max_correlated_exposure_pct: env::var("MAX_CORRELATED_EXPOSURE_PCT")
-                .unwrap_or_else(|_| "0.15".to_string())
+                .unwrap_or_else(|_| "0.10".to_string())
                 .parse()
                 .context("Failed to parse MAX_CORRELATED_EXPOSURE_PCT")?,
+            max_total_weather_exposure_pct: env::var("WEATHER_MAX_TOTAL_EXPOSURE_PCT")
+                .unwrap_or_else(|_| "0.25".to_string())
+                .parse()
+                .context("Failed to parse WEATHER_MAX_TOTAL_EXPOSURE_PCT")?,
+            weather_daily_loss_limit: env::var("WEATHER_DAILY_LOSS_LIMIT")
+                .unwrap_or_else(|_| "10.0".to_string())
+                .parse()
+                .context("Failed to parse WEATHER_DAILY_LOSS_LIMIT")?,
             position_check_enabled: env::var("POSITION_CHECK_ENABLED")
                 .unwrap_or_else(|_| "true".to_string())
                 .parse()
                 .context("Failed to parse POSITION_CHECK_ENABLED")?,
+            dashboard_port: env::var("DASHBOARD_PORT")
+                .unwrap_or_else(|_| "8080".to_string())
+                .parse()
+                .context("Failed to parse DASHBOARD_PORT")?,
+            dashboard_user: env::var("DASHBOARD_USER").unwrap_or_else(|_| "admin".to_string()),
+            dashboard_password: env::var("DASHBOARD_PASSWORD").unwrap_or_default(),
             cycle_frequency_high_secs: env::var("CYCLE_FREQUENCY_HIGH_SECS")
                 .unwrap_or_else(|_| "600".to_string())
                 .parse()
@@ -231,6 +257,11 @@ impl Config {
                 .unwrap_or_else(|_| "42".to_string())
                 .parse()
                 .context("Failed to parse DEATH_EXIT_CODE")?,
+            max_cycles: env::var("MAX_CYCLES")
+                .ok()
+                .map(|v| v.parse::<u64>())
+                .transpose()
+                .context("Failed to parse MAX_CYCLES")?,
         })
     }
 
@@ -266,6 +297,9 @@ mod tests {
         assert_eq!(config.cycle_frequency_low_secs, 1800);
         assert_eq!(config.low_bankroll_threshold, 200.0);
         assert_eq!(config.death_exit_code, 42);
+        assert_eq!(config.dashboard_port, 8080);
+        assert_eq!(config.dashboard_user, "admin");
+        assert!(config.dashboard_password.is_empty());
     }
 
     #[test]

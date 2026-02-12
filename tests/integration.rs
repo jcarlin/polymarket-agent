@@ -304,6 +304,211 @@ fn test_weather_non_weather_market_returns_none() {
 }
 
 // ═══════════════════════════════════════
+// Phase 7: Dashboard
+// ═══════════════════════════════════════
+
+#[tokio::test]
+async fn test_dashboard_status_with_data() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use polymarket_agent::dashboard::AppState;
+    use polymarket_agent::websocket::new_event_channel;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let db = Database::open_in_memory().unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO cycle_log (cycle_number, markets_scanned, markets_filtered, trades_placed, api_cost_usd, bankroll_before, bankroll_after) VALUES (1, 50, 10, 2, 0.15, 50.0, 49.85)",
+            [],
+        )
+        .unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO markets (condition_id, question, active) VALUES ('0xdash', 'Dashboard test?', 1)",
+            [],
+        )
+        .unwrap();
+    db.insert_trade("dt1", "0xdash", "tok1", "YES", 0.60, 5.0, "filled", true)
+        .unwrap();
+
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        event_tx: new_event_channel(),
+        trading_mode: "paper".to_string(),
+    };
+
+    let app = axum::Router::new()
+        .route(
+            "/api/status",
+            axum::routing::get(
+                |axum::extract::State(s): axum::extract::State<AppState>| async move {
+                    let db = s.db.lock().unwrap();
+                    let bankroll = db.get_current_bankroll().unwrap_or(0.0);
+                    let total_trades = db.get_total_trades_count().unwrap_or(0);
+                    let next_cycle = db.get_next_cycle_number().unwrap_or(1);
+                    axum::Json(serde_json::json!({
+                        "trading_mode": s.trading_mode,
+                        "bankroll": bankroll,
+                        "total_trades": total_trades,
+                        "next_cycle": next_cycle,
+                    }))
+                },
+            ),
+        )
+        .with_state(state);
+
+    let resp = app
+        .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["bankroll"], 50.0);
+    assert_eq!(json["total_trades"], 1);
+    assert_eq!(json["next_cycle"], 2);
+    assert_eq!(json["trading_mode"], "paper");
+}
+
+#[tokio::test]
+async fn test_dashboard_positions_with_data() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use polymarket_agent::dashboard::AppState;
+    use polymarket_agent::websocket::new_event_channel;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let db = Database::open_in_memory().unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+    db.conn
+        .execute(
+            "INSERT INTO markets (condition_id, question, active) VALUES ('0xpos', 'Position test?', 1)",
+            [],
+        )
+        .unwrap();
+    db.upsert_position_with_estimate("0xpos", "tok1", "YES", 0.60, 10.0, Some(0.75))
+        .unwrap();
+
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        event_tx: new_event_channel(),
+        trading_mode: "paper".to_string(),
+    };
+
+    let app = axum::Router::new()
+        .route(
+            "/api/positions",
+            axum::routing::get(
+                |axum::extract::State(s): axum::extract::State<AppState>| async move {
+                    let db = s.db.lock().unwrap();
+                    let positions = db.get_open_positions_with_market().unwrap_or_default();
+                    let resp: Vec<serde_json::Value> = positions
+                        .into_iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "market_condition_id": p.market_condition_id,
+                                "side": p.side,
+                                "entry_price": p.entry_price,
+                                "size": p.size,
+                                "question": p.question,
+                            })
+                        })
+                        .collect();
+                    axum::Json(resp)
+                },
+            ),
+        )
+        .with_state(state);
+
+    let resp = app
+        .oneshot(Request::get("/api/positions").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let json: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.len(), 1);
+    assert_eq!(json[0]["market_condition_id"], "0xpos");
+    assert_eq!(json[0]["side"], "YES");
+}
+
+#[tokio::test]
+async fn test_dashboard_history_endpoint() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use polymarket_agent::dashboard::AppState;
+    use polymarket_agent::websocket::new_event_channel;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let db = Database::open_in_memory().unwrap();
+    db.ensure_bankroll_seeded(50.0).unwrap();
+    for i in 1..=5 {
+        db.conn
+            .execute(
+                "INSERT INTO cycle_log (cycle_number, markets_scanned, markets_filtered, trades_placed, api_cost_usd, bankroll_before, bankroll_after) VALUES (?1, 20, 5, 1, 0.10, ?2, ?3)",
+                rusqlite::params![i, 50.0 - (i as f64 - 1.0) * 0.10, 50.0 - i as f64 * 0.10],
+            )
+            .unwrap();
+    }
+
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        event_tx: new_event_channel(),
+        trading_mode: "paper".to_string(),
+    };
+
+    let app = axum::Router::new()
+        .route(
+            "/api/history",
+            axum::routing::get(
+                |axum::extract::State(s): axum::extract::State<AppState>| async move {
+                    let db = s.db.lock().unwrap();
+                    let mut stmt = db.conn.prepare(
+                "SELECT cycle_number, bankroll_after FROM cycle_log ORDER BY cycle_number"
+            ).unwrap();
+                    let rows: Vec<serde_json::Value> = stmt
+                        .query_map([], |row| {
+                            Ok(serde_json::json!({
+                                "cycle_number": row.get::<_, i64>(0)?,
+                                "bankroll_after": row.get::<_, f64>(1)?,
+                            }))
+                        })
+                        .unwrap()
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    axum::Json(rows)
+                },
+            ),
+        )
+        .with_state(state);
+
+    let resp = app
+        .oneshot(Request::get("/api/history").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 1_000_000)
+        .await
+        .unwrap();
+    let json: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.len(), 5);
+    // Verify ordered by cycle_number
+    assert_eq!(json[0]["cycle_number"], 1);
+    assert_eq!(json[4]["cycle_number"], 5);
+}
+
+// ═══════════════════════════════════════
 // Phase 6: Position Management & Risk
 // ═══════════════════════════════════════
 
@@ -339,7 +544,7 @@ fn test_stop_loss_end_to_end() {
         question: Some("Stop-loss test?".to_string()),
     };
 
-    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15);
+    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15, 0.25);
     // Price at 0.50 = 16.7% loss > 15% threshold
     let action = mgr.evaluate_position(&pos, 0.50);
     assert!(matches!(action, PositionAction::Exit { .. }));
@@ -398,7 +603,7 @@ fn test_correlated_exposure_blocks_trade() {
     use polymarket_agent::db::PositionRow;
     use polymarket_agent::position_manager::PositionManager;
 
-    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15);
+    let mgr = PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15, 0.25);
 
     // Create positions in the Northeast group (NYC + BOS)
     let positions = vec![

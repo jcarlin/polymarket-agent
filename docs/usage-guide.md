@@ -99,8 +99,18 @@ POLYMARKET_WALLET_PRIVATE_KEY=0x...
 ## Running the Agent
 
 ```bash
-./target/release/polymarket-agent
+# Recommended — always recompiles before running
+cargo run --release
+
+# Alternative — separate build and run steps
+cargo build --release && ./target/release/polymarket-agent
 ```
+
+> **Warning:** Running `./target/release/polymarket-agent` directly executes
+> whatever was last compiled. If you changed source code, edited `.env` defaults
+> in `config.rs`, or pulled updates from git, **you must rebuild first** with
+> `cargo build --release`. A stale binary can silently run old logic — e.g. broad
+> market scanning instead of weather-only, burning API budget on irrelevant markets.
 
 ### Startup Sequence
 
@@ -268,6 +278,18 @@ FROM cycle_log ORDER BY cycle_number DESC LIMIT 10;
 - Check `MAX_API_COST_PER_CYCLE` is set to `0.50` (hard cap)
 - Verify cycle frequency — should be 30min cycles when bankroll < $200
 - Review API cost queries above to see per-model spend
+- If you see `Found N candidate markets` instead of `Weather-only scan` in logs,
+  the broad scan path is running — rebuild with `cargo build --release`
+
+**Verifying weather-only mode**
+
+Check the startup logs to confirm the correct scan path is running:
+
+- `Weather-only scan: N markets after filtering` — correct, weather-only path active
+- `Found N candidate markets after filtering` — wrong, broad scan is running (burning API budget on all market categories)
+- `Scanned 500 total markets` — definitely wrong, this is the paginated broad scan hitting Gamma API for everything
+
+If you see the broad scan logs, your binary is stale. Rebuild with `cargo build --release` or use `cargo run --release`.
 
 **Dashboard not loading**
 - Verify `DASHBOARD_PORT` isn't blocked or in use

@@ -1,9 +1,71 @@
 use anyhow::{Context, Result};
+use chrono::{Datelike, Utc};
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 use tracing::warn;
+
+/// City name patterns mapped to internal city codes.
+/// Used by `parse_weather_market()` to identify cities in question text.
+pub const CITY_PATTERNS: &[(&str, &str)] = &[
+    ("New York", "NYC"),
+    ("NYC", "NYC"),
+    ("Los Angeles", "LAX"),
+    ("Chicago", "CHI"),
+    ("Houston", "HOU"),
+    ("Phoenix", "PHX"),
+    ("Philadelphia", "PHL"),
+    ("San Antonio", "SAN"),
+    ("San Diego", "SDG"),
+    ("Dallas", "DAL"),
+    ("San Jose", "SJC"),
+    ("Atlanta", "ATL"),
+    ("Miami", "MIA"),
+    ("Boston", "BOS"),
+    ("Seattle", "SEA"),
+    ("Denver", "DEN"),
+    ("Washington", "DCA"),
+    ("Minneapolis", "MSP"),
+    ("Detroit", "DTW"),
+    ("Tampa", "TPA"),
+    ("St. Louis", "STL"),
+    ("St Louis", "STL"),
+];
+
+/// Map internal city code to Gamma API event slug fragment.
+/// E.g. "NYC" → "nyc", "LAX" → "los-angeles"
+pub fn city_slug(code: &str) -> Option<&'static str> {
+    match code {
+        "NYC" => Some("nyc"),
+        "LAX" => Some("los-angeles"),
+        "CHI" => Some("chicago"),
+        "HOU" => Some("houston"),
+        "PHX" => Some("phoenix"),
+        "PHL" => Some("philadelphia"),
+        "SAN" => Some("san-antonio"),
+        "SDG" => Some("san-diego"),
+        "DAL" => Some("dallas"),
+        "SJC" => Some("san-jose"),
+        "ATL" => Some("atlanta"),
+        "MIA" => Some("miami"),
+        "BOS" => Some("boston"),
+        "SEA" => Some("seattle"),
+        "DEN" => Some("denver"),
+        "DCA" => Some("washington"),
+        "MSP" => Some("minneapolis"),
+        "DTW" => Some("detroit"),
+        "TPA" => Some("tampa"),
+        "STL" => Some("st-louis"),
+        _ => None,
+    }
+}
+
+/// All unique city codes (deduplicated from CITY_PATTERNS).
+pub const WEATHER_CITY_CODES: &[&str] = &[
+    "NYC", "LAX", "CHI", "HOU", "PHX", "PHL", "SAN", "SDG", "DAL", "SJC",
+    "ATL", "MIA", "BOS", "SEA", "DEN", "DCA", "MSP", "DTW", "TPA", "STL",
+];
 
 /// Probability for a single temperature bucket
 #[derive(Debug, Clone, Deserialize)]
@@ -154,40 +216,14 @@ impl WeatherClient {
 /// - "Will the high temperature in Chicago on March 5, 2026 be 60°F or above?"
 /// - "Will the high temperature in NYC on 2026-02-20 be 72-74°F?"
 pub fn parse_weather_market(question: &str) -> Option<WeatherMarketInfo> {
-    // City name mapping to our codes
-    let city_patterns: Vec<(&str, &str)> = vec![
-        ("New York", "NYC"),
-        ("NYC", "NYC"),
-        ("Los Angeles", "LAX"),
-        ("Chicago", "CHI"),
-        ("Houston", "HOU"),
-        ("Phoenix", "PHX"),
-        ("Philadelphia", "PHL"),
-        ("San Antonio", "SAN"),
-        ("San Diego", "SDG"),
-        ("Dallas", "DAL"),
-        ("San Jose", "SJC"),
-        ("Atlanta", "ATL"),
-        ("Miami", "MIA"),
-        ("Boston", "BOS"),
-        ("Seattle", "SEA"),
-        ("Denver", "DEN"),
-        ("Washington", "DCA"),
-        ("Minneapolis", "MSP"),
-        ("Detroit", "DTW"),
-        ("Tampa", "TPA"),
-        ("St. Louis", "STL"),
-        ("St Louis", "STL"),
-    ];
-
     // Must contain "temperature" to be a weather market
     let q_lower = question.to_lowercase();
     if !q_lower.contains("temperature") {
         return None;
     }
 
-    // Find city
-    let city_code = city_patterns.iter().find_map(|(pattern, code)| {
+    // Find city using module-level constant
+    let city_code = CITY_PATTERNS.iter().find_map(|(pattern, code)| {
         if question.contains(pattern) {
             Some(code.to_string())
         } else {
@@ -221,29 +257,39 @@ fn extract_date(question: &str) -> Option<String> {
     }
 
     // Try "Month Day, Year" format: February 20, 2026
-    let month_re = Regex::new(
+    let month_year_re = Regex::new(
         r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})"
     ).ok()?;
 
-    if let Some(caps) = month_re.captures(question) {
+    if let Some(caps) = month_year_re.captures(question) {
         let month_name = &caps[1];
         let day: u32 = caps[2].parse().ok()?;
         let year: u32 = caps[3].parse().ok()?;
 
-        let month = match month_name.to_lowercase().as_str() {
-            "january" => 1,
-            "february" => 2,
-            "march" => 3,
-            "april" => 4,
-            "may" => 5,
-            "june" => 6,
-            "july" => 7,
-            "august" => 8,
-            "september" => 9,
-            "october" => 10,
-            "november" => 11,
-            "december" => 12,
-            _ => return None,
+        let month = month_name_to_number(month_name)?;
+        return Some(format!("{:04}-{:02}-{:02}", year, month, day));
+    }
+
+    // Try "on Month Day" format (no year): "on February 11"
+    // Actual Polymarket format: "...be between 34-35°F on February 11?"
+    let month_only_re = Regex::new(
+        r"(?i)on\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})\b"
+    ).ok()?;
+
+    if let Some(caps) = month_only_re.captures(question) {
+        let month_name = &caps[1];
+        let day: u32 = caps[2].parse().ok()?;
+        let month = month_name_to_number(month_name)?;
+
+        // Infer year: if month/day is more than 7 days in the past, assume next year
+        let today = Utc::now().date_naive();
+        let current_year = today.year();
+
+        let candidate = chrono::NaiveDate::from_ymd_opt(current_year, month, day)?;
+        let year = if candidate < today - chrono::Duration::days(7) {
+            current_year + 1
+        } else {
+            current_year
         };
 
         return Some(format!("{:04}-{:02}-{:02}", year, month, day));
@@ -252,17 +298,44 @@ fn extract_date(question: &str) -> Option<String> {
     None
 }
 
+/// Convert month name to number (1-12)
+fn month_name_to_number(name: &str) -> Option<u32> {
+    match name.to_lowercase().as_str() {
+        "january" => Some(1),
+        "february" => Some(2),
+        "march" => Some(3),
+        "april" => Some(4),
+        "may" => Some(5),
+        "june" => Some(6),
+        "july" => Some(7),
+        "august" => Some(8),
+        "september" => Some(9),
+        "october" => Some(10),
+        "november" => Some(11),
+        "december" => Some(12),
+        _ => None,
+    }
+}
+
 /// Extract temperature range (lower, upper) from question text
 fn extract_temperature_range(question: &str) -> Option<(f64, f64)> {
     // Pattern: "between X°F and Y°F" or "between XF and YF"
-    let between_re = Regex::new(r"between\s+(\d+)°?F?\s+and\s+(\d+)°?F").ok()?;
-    if let Some(caps) = between_re.captures(question) {
+    let between_and_re = Regex::new(r"between\s+(\d+)°?F?\s+and\s+(\d+)°?F").ok()?;
+    if let Some(caps) = between_and_re.captures(question) {
         let lower: f64 = caps[1].parse().ok()?;
         let upper: f64 = caps[2].parse().ok()?;
         return Some((lower, upper));
     }
 
-    // Pattern: "X-Y°F" or "X - Y°F"
+    // Pattern: "between X-Y°F" (actual Polymarket format)
+    let between_dash_re = Regex::new(r"between\s+(\d+)\s*[-\u{2013}]\s*(\d+)°F").ok()?;
+    if let Some(caps) = between_dash_re.captures(question) {
+        let lower: f64 = caps[1].parse().ok()?;
+        let upper: f64 = caps[2].parse().ok()?;
+        return Some((lower, upper));
+    }
+
+    // Pattern: "X-Y°F" or "X - Y°F" (standalone range without "between")
     let range_re = Regex::new(r"(\d+)\s*[-\u{2013}]\s*(\d+)°F").ok()?;
     if let Some(caps) = range_re.captures(question) {
         let lower: f64 = caps[1].parse().ok()?;
@@ -270,18 +343,25 @@ fn extract_temperature_range(question: &str) -> Option<(f64, f64)> {
         return Some((lower, upper));
     }
 
-    // Pattern: "X°F or above" / "X°F or higher" → bucket [X, 130)
+    // Pattern: "X°F or above" / "X°F or higher" → bucket [X, 130]
     let above_re = Regex::new(r"(\d+)°F\s+or\s+(?:above|higher|more)").ok()?;
     if let Some(caps) = above_re.captures(question) {
         let lower: f64 = caps[1].parse().ok()?;
         return Some((lower, 130.0));
     }
 
-    // Pattern: "below X°F" / "under X°F" → bucket [0, X)
+    // Pattern: "X°F or below" (actual Polymarket format) → bucket [-60, X]
+    let or_below_re = Regex::new(r"(\d+)°F\s+or\s+below").ok()?;
+    if let Some(caps) = or_below_re.captures(question) {
+        let upper: f64 = caps[1].parse().ok()?;
+        return Some((-60.0, upper));
+    }
+
+    // Pattern: "below X°F" / "under X°F" → bucket [-60, X]
     let below_re = Regex::new(r"(?:below|under)\s+(\d+)°F").ok()?;
     if let Some(caps) = below_re.captures(question) {
         let upper: f64 = caps[1].parse().ok()?;
-        return Some((0.0, upper));
+        return Some((-60.0, upper));
     }
 
     None
@@ -304,7 +384,7 @@ pub fn get_weather_model_probability(
     }
 
     // For "below X" type markets, sum all buckets < upper
-    if info.bucket_lower <= 0.0 {
+    if info.bucket_lower <= -59.0 {
         let total: f64 = probs
             .buckets
             .iter()
@@ -437,41 +517,71 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
+    // --- Tests using actual Polymarket question formats ---
+
     #[test]
-    fn test_parse_weather_market_between() {
-        let q = "Will the high temperature in New York City on February 20, 2026 be between 74\u{00b0}F and 76\u{00b0}F?";
+    fn test_parse_weather_market_between_dash() {
+        // Actual Polymarket format: "between X-Y°F on Month Day" (no year)
+        let q = "Will the highest temperature in New York City be between 34-35\u{00b0}F on February 11?";
         let info = parse_weather_market(q).unwrap();
         assert_eq!(info.city, "NYC");
-        assert_eq!(info.date, "2026-02-20");
-        assert_eq!(info.bucket_lower, 74.0);
-        assert_eq!(info.bucket_upper, 76.0);
-        assert_eq!(info.bucket_label, "74-76");
+        assert_eq!(info.bucket_lower, 34.0);
+        assert_eq!(info.bucket_upper, 35.0);
+        assert_eq!(info.bucket_label, "34-35");
+        // Date should be inferred with current year (or next year if past)
+        assert!(info.date.starts_with("20")); // valid year
+        assert!(info.date.ends_with("-02-11"));
     }
 
     #[test]
-    fn test_parse_weather_market_range_dash() {
-        let q = "Will the high temperature in Chicago on 2026-03-05 be 60-62\u{00b0}F?";
+    fn test_parse_weather_market_or_below() {
+        // Actual Polymarket format: "X°F or below"
+        let q = "Will the highest temperature in Chicago be 33\u{00b0}F or below on February 11?";
         let info = parse_weather_market(q).unwrap();
         assert_eq!(info.city, "CHI");
-        assert_eq!(info.date, "2026-03-05");
-        assert_eq!(info.bucket_lower, 60.0);
-        assert_eq!(info.bucket_upper, 62.0);
+        assert_eq!(info.bucket_lower, -60.0);
+        assert_eq!(info.bucket_upper, 33.0);
+        assert!(info.date.ends_with("-02-11"));
     }
 
     #[test]
-    fn test_parse_weather_market_or_above() {
-        let q = "Will the high temperature in Miami on March 10, 2026 be 90\u{00b0}F or above?";
+    fn test_parse_weather_market_or_higher() {
+        // Actual Polymarket format: "X°F or higher"
+        let q = "Will the highest temperature in Miami be 78\u{00b0}F or higher on February 12?";
         let info = parse_weather_market(q).unwrap();
         assert_eq!(info.city, "MIA");
-        assert_eq!(info.date, "2026-03-10");
-        assert_eq!(info.bucket_lower, 90.0);
+        assert_eq!(info.bucket_lower, 78.0);
         assert_eq!(info.bucket_upper, 130.0);
+        assert!(info.date.ends_with("-02-12"));
     }
 
     #[test]
     fn test_parse_weather_market_not_weather() {
         let q = "Will Bitcoin reach $100,000 by March 2026?";
         assert!(parse_weather_market(q).is_none());
+    }
+
+    // --- Legacy format tests (kept as fallback coverage) ---
+
+    #[test]
+    fn test_parse_weather_market_between_and() {
+        // Legacy format: "between X°F and Y°F" with full date
+        let q = "Will the high temperature in New York City on February 20, 2026 be between 74\u{00b0}F and 76\u{00b0}F?";
+        let info = parse_weather_market(q).unwrap();
+        assert_eq!(info.city, "NYC");
+        assert_eq!(info.date, "2026-02-20");
+        assert_eq!(info.bucket_lower, 74.0);
+        assert_eq!(info.bucket_upper, 76.0);
+    }
+
+    #[test]
+    fn test_parse_weather_market_iso_date() {
+        let q = "Will the high temperature in Chicago on 2026-03-05 be 60-62\u{00b0}F?";
+        let info = parse_weather_market(q).unwrap();
+        assert_eq!(info.city, "CHI");
+        assert_eq!(info.date, "2026-03-05");
+        assert_eq!(info.bucket_lower, 60.0);
+        assert_eq!(info.bucket_upper, 62.0);
     }
 
     #[test]

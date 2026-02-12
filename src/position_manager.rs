@@ -3,7 +3,9 @@ use tracing::{info, warn};
 
 use crate::clob_client::ClobClient;
 use crate::db::{Database, PositionRow};
-use crate::weather_client::parse_weather_market;
+use crate::weather_client::{
+    get_weather_model_probability, parse_weather_market, WeatherClient,
+};
 
 /// Action to take for a position after management checks.
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +56,7 @@ pub struct PositionManager {
     pub volume_spike_factor: f64,
     pub whale_move_threshold: f64,
     pub max_correlated_exposure_pct: f64,
+    pub max_total_weather_exposure_pct: f64,
     correlation_groups: Vec<CorrelationGroup>,
 }
 
@@ -65,6 +68,7 @@ impl PositionManager {
         volume_spike_factor: f64,
         whale_move_threshold: f64,
         max_correlated_exposure_pct: f64,
+        max_total_weather_exposure_pct: f64,
     ) -> Self {
         let correlation_groups = vec![
             CorrelationGroup {
@@ -111,16 +115,19 @@ impl PositionManager {
             volume_spike_factor,
             whale_move_threshold,
             max_correlated_exposure_pct,
+            max_total_weather_exposure_pct,
             correlation_groups,
         }
     }
 
     /// Run all position management checks for open positions.
+    /// `weather_client`: if provided, used to refresh ensemble probabilities for weather positions.
     pub async fn check_positions(
         &self,
         db: &Database,
         clob: &ClobClient,
         cycle_number: i64,
+        weather_client: Option<&WeatherClient>,
     ) -> Result<PositionManagementResult> {
         let positions = db.get_open_positions_with_market()?;
         let mut exits_triggered = Vec::new();
@@ -148,7 +155,39 @@ impl PositionManager {
                 }
             };
 
-            let action = self.evaluate_position(pos, current_price);
+            // For weather positions, refresh ensemble probability before edge decay check
+            let mut pos_refreshed = pos.clone();
+            if let (Some(wc), Some(question)) = (weather_client, pos.question.as_ref()) {
+                if let Some(info) = parse_weather_market(question) {
+                    match wc.get_probabilities(&info.city, &info.date).await {
+                        Ok(probs) => {
+                            if let Some(fresh_prob) = get_weather_model_probability(&info, &probs) {
+                                info!(
+                                    "Refreshed weather estimate for {}: {:.3} → {:.3}",
+                                    pos.market_condition_id,
+                                    pos.estimated_probability.unwrap_or(0.0),
+                                    fresh_prob,
+                                );
+                                pos_refreshed.estimated_probability = Some(fresh_prob);
+                                if let Err(e) = db.update_position_estimate(
+                                    &pos.market_condition_id,
+                                    fresh_prob,
+                                ) {
+                                    warn!("Failed to update position estimate: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Weather refresh failed for {}: {} — using stale estimate",
+                                pos.market_condition_id, e,
+                            );
+                        }
+                    }
+                }
+            }
+
+            let action = self.evaluate_position(&pos_refreshed, current_price);
 
             match action {
                 PositionAction::Hold => {}
@@ -210,17 +249,27 @@ impl PositionManager {
 
     /// Evaluate a single position and decide what action to take.
     pub fn evaluate_position(&self, pos: &PositionRow, current_price: f64) -> PositionAction {
-        // Stop-loss check: position value dropped too much
-        if let Some(action) = self.check_stop_loss(pos, current_price) {
-            return action;
+        let is_weather = pos
+            .question
+            .as_ref()
+            .is_some_and(|q| parse_weather_market(q).is_some());
+
+        // Weather markets: skip price-based stop-loss and take-profit.
+        // These are small binary bets that resolve in days — hold to resolution.
+        // Only exit on edge decay (i.e., new ensemble forecast changes our model probability).
+        if !is_weather {
+            // Stop-loss check: position value dropped too much
+            if let Some(action) = self.check_stop_loss(pos, current_price) {
+                return action;
+            }
+
+            // Take-profit check: captured enough of expected value
+            if let Some(action) = self.check_take_profit(pos, current_price) {
+                return action;
+            }
         }
 
-        // Take-profit check: captured enough of expected value
-        if let Some(action) = self.check_take_profit(pos, current_price) {
-            return action;
-        }
-
-        // Edge decay check: edge has shrunk below minimum
+        // Edge decay check: exit if model-based edge has shrunk below minimum
         if let Some(action) = self.check_edge_decay(pos, current_price) {
             return action;
         }
@@ -405,6 +454,31 @@ impl PositionManager {
         group_exposure >= max_group_exposure
     }
 
+    /// Check if total weather exposure exceeds the global weather cap.
+    /// Returns true if new weather bets should be blocked.
+    pub fn is_total_weather_over_limit(
+        &self,
+        positions: &[PositionRow],
+        bankroll: f64,
+    ) -> bool {
+        if bankroll <= 0.0 {
+            return false;
+        }
+
+        let max_weather_exposure = self.max_total_weather_exposure_pct * bankroll;
+        let total_weather_exposure: f64 = positions
+            .iter()
+            .filter(|p| {
+                p.question
+                    .as_ref()
+                    .is_some_and(|q| parse_weather_market(q).is_some())
+            })
+            .map(|p| p.entry_price * p.size)
+            .sum();
+
+        total_weather_exposure >= max_weather_exposure
+    }
+
     /// Compute drawdown state from peak and current bankroll.
     pub fn check_drawdown(
         db: &Database,
@@ -444,7 +518,7 @@ mod tests {
     use super::*;
 
     fn make_manager() -> PositionManager {
-        PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.15)
+        PositionManager::new(0.15, 0.90, 0.02, 3.0, 5000.0, 0.10, 0.25)
     }
 
     fn make_position(entry_price: f64, size: f64) -> PositionRow {
@@ -604,6 +678,43 @@ mod tests {
         assert_eq!(action, PositionAction::Hold);
     }
 
+    // ── Weather markets skip price-based exits ──
+
+    #[test]
+    fn test_weather_market_no_stop_loss() {
+        let mgr = make_manager();
+        let mut pos = make_weather_position("NYC", 0.036, 80.0);
+        pos.estimated_probability = Some(0.75);
+        // Price dropped 67% (0.036 → 0.012) — would trigger stop-loss on non-weather
+        // but weather markets hold to resolution
+        let action = mgr.evaluate_position(&pos, 0.012);
+        assert_eq!(action, PositionAction::Hold);
+    }
+
+    #[test]
+    fn test_weather_market_no_take_profit() {
+        let mgr = make_manager();
+        let mut pos = make_weather_position("NYC", 0.036, 80.0);
+        pos.estimated_probability = Some(0.75);
+        // Price rose to 0.95 — would trigger take-profit on non-weather
+        // but weather markets hold to resolution
+        let action = mgr.evaluate_position(&pos, 0.95);
+        assert_eq!(action, PositionAction::Hold);
+    }
+
+    #[test]
+    fn test_weather_market_still_exits_on_edge_decay() {
+        let mgr = make_manager();
+        let mut pos = make_weather_position("NYC", 0.036, 80.0);
+        pos.estimated_probability = Some(0.04);
+        // Model now says 4%, market at 3.5% → edge = 0.5% < 2% threshold
+        let action = mgr.evaluate_position(&pos, 0.035);
+        assert!(matches!(action, PositionAction::Exit { .. }));
+        if let PositionAction::Exit { reason } = action {
+            assert!(reason.contains("Edge decay"));
+        }
+    }
+
     // ── Stop-loss takes priority over edge decay ──
 
     #[test]
@@ -657,7 +768,7 @@ mod tests {
         let mgr = make_manager();
         let positions = vec![make_weather_position("NYC", 0.50, 5.0)];
         // Exposure = 0.50 * 5.0 = 2.50
-        // Limit = 0.15 * 100.0 = 15.0
+        // Limit = 0.10 * 100.0 = 10.0
         let alerts = mgr.check_correlated_exposure(&positions, 100.0);
         assert!(alerts.is_empty());
     }
@@ -666,11 +777,11 @@ mod tests {
     fn test_correlated_exposure_exceeds_limit() {
         let mgr = make_manager();
         let positions = vec![
-            make_weather_position("NYC", 0.50, 20.0), // 10.0
-            make_weather_position("PHL", 0.50, 20.0), // 10.0
+            make_weather_position("NYC", 0.50, 12.0), // 6.0
+            make_weather_position("PHL", 0.50, 12.0), // 6.0
         ];
-        // Total NE exposure = 20.0
-        // Limit = 0.15 * 100.0 = 15.0
+        // Total NE exposure = 12.0
+        // Limit = 0.10 * 100.0 = 10.0
         let alerts = mgr.check_correlated_exposure(&positions, 100.0);
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].details.contains("Northeast"));
@@ -683,7 +794,7 @@ mod tests {
             make_weather_position("NYC", 0.50, 10.0), // NE: 5.0
             make_weather_position("CHI", 0.50, 10.0), // MW: 5.0
         ];
-        // Each group at 5.0, limit = 15.0 → both within limit
+        // Each group at 5.0, limit = 10.0 → both within limit
         let alerts = mgr.check_correlated_exposure(&positions, 100.0);
         assert!(alerts.is_empty());
     }
@@ -692,10 +803,10 @@ mod tests {
     fn test_is_correlated_group_over_limit() {
         let mgr = make_manager();
         let positions = vec![
-            make_weather_position("NYC", 0.50, 20.0),
-            make_weather_position("BOS", 0.50, 20.0),
+            make_weather_position("NYC", 0.50, 12.0),
+            make_weather_position("BOS", 0.50, 12.0),
         ];
-        // NE exposure = 20.0, limit = 0.15 * 100 = 15.0
+        // NE exposure = 12.0, limit = 0.10 * 100 = 10.0
         let question = "Will the high temperature in Philadelphia on February 20, 2026 be between 40\u{00b0}F and 42\u{00b0}F?";
         assert!(mgr.is_correlated_group_over_limit(question, &positions, 100.0));
     }
@@ -704,9 +815,33 @@ mod tests {
     fn test_is_correlated_group_not_over_limit() {
         let mgr = make_manager();
         let positions = vec![make_weather_position("NYC", 0.50, 5.0)];
-        // NE exposure = 2.5, limit = 15.0
+        // NE exposure = 2.5, limit = 10.0
         let question = "Will the high temperature in Philadelphia on February 20, 2026 be between 40\u{00b0}F and 42\u{00b0}F?";
         assert!(!mgr.is_correlated_group_over_limit(question, &positions, 100.0));
+    }
+
+    // ── Total weather exposure cap ──
+
+    #[test]
+    fn test_total_weather_exposure_within_limit() {
+        let mgr = make_manager();
+        let positions = vec![
+            make_weather_position("NYC", 0.03, 100.0), // 3.0
+            make_weather_position("CHI", 0.03, 100.0), // 3.0
+        ];
+        // Total weather = 6.0, limit = 0.25 * 100 = 25.0
+        assert!(!mgr.is_total_weather_over_limit(&positions, 100.0));
+    }
+
+    #[test]
+    fn test_total_weather_exposure_exceeds_limit() {
+        let mgr = make_manager();
+        let positions = vec![
+            make_weather_position("NYC", 0.50, 30.0), // 15.0
+            make_weather_position("CHI", 0.50, 30.0), // 15.0
+        ];
+        // Total weather = 30.0, limit = 0.25 * 100 = 25.0
+        assert!(mgr.is_total_weather_over_limit(&positions, 100.0));
     }
 
     #[test]

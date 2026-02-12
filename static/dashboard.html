@@ -4,11 +4,383 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Polymarket Agent Dashboard</title>
-  <!-- Phase 7: Full dashboard will be built here -->
-  <!-- Chart.js via CDN, vanilla JS, WebSocket connection to Rust backend -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #c9d1d9; --text-dim: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 14px; }
+    a { color: var(--accent); }
+    .header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 24px; border-bottom: 1px solid var(--border);
+    }
+    .header h1 { font-size: 18px; font-weight: 600; }
+    .header-right { display: flex; align-items: center; gap: 12px; }
+    .badge {
+      padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 700; text-transform: uppercase;
+    }
+    .badge-paper { background: var(--green); color: #000; }
+    .badge-live { background: var(--red); color: #fff; }
+    .heartbeat {
+      width: 10px; height: 10px; border-radius: 50%; background: var(--green);
+      animation: pulse 2s infinite;
+    }
+    .heartbeat.disconnected { background: var(--red); animation: none; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .stats-bar {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 1px; background: var(--border); border-bottom: 1px solid var(--border);
+    }
+    .stat {
+      background: var(--surface); padding: 12px 16px; text-align: center;
+    }
+    .stat-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 4px; }
+    .stat-value { font-size: 20px; font-weight: 700; }
+    .pnl-pos { color: var(--green); }
+    .pnl-neg { color: var(--red); }
+
+    .grid {
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 16px; padding: 16px 24px;
+    }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; overflow: hidden;
+    }
+    .card-header {
+      padding: 10px 14px; border-bottom: 1px solid var(--border);
+      font-size: 13px; font-weight: 600; color: var(--text-dim);
+    }
+    .card-body { padding: 12px 14px; max-height: 360px; overflow-y: auto; }
+    .card-body.chart-body { max-height: none; padding: 8px; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { text-align: left; color: var(--text-dim); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    td { padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    tr:last-child td { border-bottom: none; }
+    .side-yes { color: var(--green); }
+    .side-no { color: var(--red); }
+    .empty-msg { color: var(--text-dim); font-style: italic; padding: 20px; text-align: center; }
+
+    .alert-item {
+      padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12px;
+    }
+    .alert-item:last-child { border-bottom: none; }
+    .alert-type { color: var(--yellow); font-weight: 600; }
+    .alert-time { color: var(--text-dim); font-size: 11px; }
+  </style>
 </head>
 <body>
-  <h1>Polymarket Agent — Dashboard</h1>
-  <p>Not yet implemented. Build Phase 7 to activate.</p>
+  <div class="header">
+    <h1>Polymarket Agent</h1>
+    <div class="header-right">
+      <span id="mode-badge" class="badge badge-paper">PAPER</span>
+      <div id="heartbeat" class="heartbeat" title="WebSocket status"></div>
+    </div>
+  </div>
+
+  <div class="stats-bar">
+    <div class="stat"><div class="stat-label">Bankroll</div><div class="stat-value" id="s-bankroll">--</div></div>
+    <div class="stat"><div class="stat-label">Exposure</div><div class="stat-value" id="s-exposure">--</div></div>
+    <div class="stat"><div class="stat-label">P&amp;L</div><div class="stat-value" id="s-pnl">--</div></div>
+    <div class="stat"><div class="stat-label">Trades</div><div class="stat-value" id="s-trades">--</div></div>
+    <div class="stat"><div class="stat-label">Cycles</div><div class="stat-value" id="s-cycles">--</div></div>
+    <div class="stat"><div class="stat-label">API Cost (24h)</div><div class="stat-value" id="s-api">--</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-header">Bankroll History</div>
+      <div class="card-body chart-body"><canvas id="bankroll-chart"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="card-header">Open Positions</div>
+      <div class="card-body" id="positions-body"><div class="empty-msg">No open positions</div></div>
+    </div>
+    <div class="card">
+      <div class="card-header">Recent Trades</div>
+      <div class="card-body" id="trades-body"><div class="empty-msg">No trades yet</div></div>
+    </div>
+    <div class="card">
+      <div class="card-header">Position Alerts</div>
+      <div class="card-body" id="alerts-body"><div class="empty-msg">No alerts</div></div>
+    </div>
+    <div class="card">
+      <div class="card-header">Weather Forecasts</div>
+      <div class="card-body" id="weather-body"><div class="empty-msg">No weather data</div></div>
+    </div>
+    <div class="card">
+      <div class="card-header">Opportunity Pipeline</div>
+      <div class="card-body" id="opportunities-body"><div class="empty-msg">No opportunities</div></div>
+    </div>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+const usd = v => v != null ? '$' + Number(v).toFixed(2) : '--';
+const pnlClass = v => v >= 0 ? 'pnl-pos' : 'pnl-neg';
+const sideClass = s => s === 'YES' || s === 'Yes' ? 'side-yes' : 'side-no';
+const shortId = id => id && id.length > 10 ? id.slice(0, 6) + '...' + id.slice(-4) : id;
+const fmtTime = ts => {
+  if (!ts) return '';
+  const d = new Date(ts.includes('T') ? ts : ts + 'Z');
+  return d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+};
+
+let initialBankroll = 50;
+let chart;
+
+function initChart(history) {
+  const labels = history.map(h => h.cycle_number);
+  const data = history.map(h => h.bankroll_after ?? h.bankroll_before ?? 0);
+  if (data.length > 0) initialBankroll = history[0].bankroll_before ?? 50;
+
+  chart = new Chart($('bankroll-chart'), {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Bankroll ($)',
+        data, borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.1)',
+        fill: true, tension: 0.3, pointRadius: 2,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#30363d' } },
+        y: { ticks: { color: '#8b949e', callback: v => '$' + v }, grid: { color: '#30363d' } }
+      }
+    }
+  });
+}
+
+function updateStats(s) {
+  $('s-bankroll').textContent = usd(s.bankroll);
+  $('s-exposure').textContent = usd(s.exposure);
+  const pnl = s.bankroll - initialBankroll;
+  const pnlEl = $('s-pnl');
+  pnlEl.textContent = (pnl >= 0 ? '+' : '') + usd(pnl).replace('$','$');
+  pnlEl.className = 'stat-value ' + pnlClass(pnl);
+  $('s-trades').textContent = s.total_trades;
+  $('s-cycles').textContent = s.next_cycle - 1;
+  $('s-api').textContent = usd(s.api_cost_24h);
+
+  const badge = $('mode-badge');
+  badge.textContent = s.trading_mode.toUpperCase();
+  badge.className = 'badge badge-' + s.trading_mode;
+}
+
+function renderPositions(positions) {
+  const el = $('positions-body');
+  if (!positions.length) { el.innerHTML = '<div class="empty-msg">No open positions</div>'; return; }
+  let html = '<table><tr><th>Market</th><th>Side</th><th>Entry</th><th>Current</th><th>Size</th><th>P&L</th></tr>';
+  for (const p of positions) {
+    const q = p.question ? (p.question.length > 40 ? p.question.slice(0,37) + '...' : p.question) : shortId(p.market_condition_id);
+    html += `<tr>
+      <td title="${(p.question||'').replace(/"/g,'&quot;')}">${q}</td>
+      <td class="${sideClass(p.side)}">${p.side}</td>
+      <td>${p.entry_price.toFixed(2)}</td>
+      <td>${p.current_price != null ? p.current_price.toFixed(2) : '--'}</td>
+      <td>${p.size.toFixed(1)}</td>
+      <td class="${pnlClass(p.unrealized_pnl)}">${usd(p.unrealized_pnl)}</td>
+    </tr>`;
+  }
+  el.innerHTML = html + '</table>';
+}
+
+function renderTrades(trades) {
+  const el = $('trades-body');
+  if (!trades.length) { el.innerHTML = '<div class="empty-msg">No trades yet</div>'; return; }
+  let html = '<table><tr><th>Time</th><th>Side</th><th>Market</th><th>Price</th><th>Size</th><th>Mode</th></tr>';
+  for (const t of trades) {
+    html += `<tr>
+      <td>${fmtTime(t.created_at)}</td>
+      <td class="${sideClass(t.side)}">${t.side}</td>
+      <td title="${t.market_condition_id}">${shortId(t.market_condition_id)}</td>
+      <td>${t.price.toFixed(2)}</td>
+      <td>${t.size.toFixed(1)}</td>
+      <td>${t.paper ? 'PAPER' : 'LIVE'}</td>
+    </tr>`;
+  }
+  el.innerHTML = html + '</table>';
+}
+
+function renderAlerts(alerts) {
+  const el = $('alerts-body');
+  if (!alerts.length) { el.innerHTML = '<div class="empty-msg">No alerts</div>'; return; }
+  el.innerHTML = alerts.map(a => `
+    <div class="alert-item">
+      <span class="alert-type">${a.alert_type}</span>
+      <span class="alert-time">${fmtTime(a.created_at)}</span><br>
+      ${a.details || ''} <span style="color:var(--text-dim)">${shortId(a.market_condition_id)}</span>
+    </div>
+  `).join('');
+}
+
+function prependTrade(t) {
+  const el = $('trades-body');
+  if (el.querySelector('.empty-msg')) el.innerHTML = '<table><tr><th>Time</th><th>Side</th><th>Market</th><th>Price</th><th>Size</th><th>Mode</th></tr></table>';
+  const table = el.querySelector('table');
+  if (!table) return;
+  const row = document.createElement('tr');
+  row.innerHTML = `
+    <td>${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</td>
+    <td class="${sideClass(t.side)}">${t.side}</td>
+    <td title="${t.market_id}">${shortId(t.market_id)}</td>
+    <td>${t.price.toFixed(2)}</td>
+    <td>${t.size.toFixed(1)}</td>
+    <td>${t.paper ? 'PAPER' : 'LIVE'}</td>`;
+  const firstRow = table.querySelector('tr:nth-child(2)');
+  if (firstRow) table.insertBefore(row, firstRow);
+  else table.appendChild(row);
+}
+
+function renderWeather(data) {
+  const el = $('weather-body');
+  if (!data.length) { el.innerHTML = '<div class="empty-msg">No weather data</div>'; return; }
+  let html = '<table><tr><th>City</th><th>Date</th><th>Mean</th><th>Std</th><th>Members</th></tr>';
+  for (const w of data) {
+    html += `<tr>
+      <td>${w.city}</td>
+      <td>${w.forecast_date}</td>
+      <td>${w.ensemble_mean.toFixed(1)}&deg;F</td>
+      <td>&plusmn;${w.ensemble_std.toFixed(1)}</td>
+      <td>${w.gefs_count + w.ecmwf_count}</td>
+    </tr>`;
+  }
+  el.innerHTML = html + '</table>';
+}
+
+function renderOpportunities(data) {
+  const el = $('opportunities-body');
+  if (!data.length) { el.innerHTML = '<div class="empty-msg">No opportunities</div>'; return; }
+  let html = '<table><tr><th>Market</th><th>Side</th><th>Mkt</th><th>Model</th><th>Edge</th><th>Status</th></tr>';
+  for (const o of data) {
+    const q = o.question.length > 35 ? o.question.slice(0,32) + '...' : o.question;
+    const statusColor = o.status === 'executed' ? 'var(--green)' : o.status === 'rejected' ? 'var(--yellow)' : 'var(--text-dim)';
+    html += `<tr>
+      <td title="${o.question.replace(/"/g,'&quot;')}">${q}</td>
+      <td class="${sideClass(o.side)}">${o.side}</td>
+      <td>${o.market_price.toFixed(2)}</td>
+      <td>${o.estimated_probability.toFixed(2)}</td>
+      <td>${(o.edge * 100).toFixed(1)}%</td>
+      <td style="color:${statusColor}">${o.status}${o.reject_reason ? ' (' + o.reject_reason + ')' : ''}</td>
+    </tr>`;
+  }
+  el.innerHTML = html + '</table>';
+}
+
+// ─── Data fetching ─────────────────────────────────
+
+async function fetchAll() {
+  try {
+    const [status, positions, trades, history, alerts, weather, opportunities] = await Promise.all([
+      fetch('/api/status').then(r => r.json()),
+      fetch('/api/positions').then(r => r.json()),
+      fetch('/api/trades').then(r => r.json()),
+      fetch('/api/history').then(r => r.json()),
+      fetch('/api/alerts').then(r => r.json()),
+      fetch('/api/weather').then(r => r.json()),
+      fetch('/api/opportunities').then(r => r.json()),
+    ]);
+    updateStats(status);
+    renderPositions(positions);
+    renderTrades(trades);
+    renderAlerts(alerts);
+    renderWeather(weather);
+    renderOpportunities(opportunities);
+    initChart(history);
+  } catch (e) {
+    console.error('Fetch error:', e);
+  }
+}
+
+// ─── WebSocket ─────────────────────────────────────
+
+let ws;
+let wsRetryMs = 1000;
+
+function connectWs() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => {
+    $('heartbeat').classList.remove('disconnected');
+    wsRetryMs = 1000;
+    console.log('WS connected');
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const ev = JSON.parse(e.data);
+      switch (ev.type) {
+        case 'cycle_complete':
+          $('s-bankroll').textContent = usd(ev.bankroll);
+          $('s-exposure').textContent = usd(ev.exposure);
+          if (chart) {
+            chart.data.labels.push(ev.cycle_number);
+            chart.data.datasets[0].data.push(ev.bankroll);
+            chart.update('none');
+          }
+          // Refresh data after cycle
+          fetch('/api/positions').then(r => r.json()).then(renderPositions).catch(() => {});
+          fetch('/api/status').then(r => r.json()).then(updateStats).catch(() => {});
+          fetch('/api/weather').then(r => r.json()).then(renderWeather).catch(() => {});
+          fetch('/api/opportunities').then(r => r.json()).then(renderOpportunities).catch(() => {});
+          break;
+        case 'trade_executed':
+          prependTrade(ev);
+          break;
+        case 'position_exit':
+          fetch('/api/positions').then(r => r.json()).then(renderPositions).catch(() => {});
+          break;
+        case 'position_alert':
+          const alertsBody = $('alerts-body');
+          if (alertsBody.querySelector('.empty-msg')) alertsBody.innerHTML = '';
+          alertsBody.insertAdjacentHTML('afterbegin', `
+            <div class="alert-item">
+              <span class="alert-type">${ev.alert_type}</span>
+              <span class="alert-time">${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</span><br>
+              ${ev.details} <span style="color:var(--text-dim)">${shortId(ev.market_id)}</span>
+            </div>`);
+          break;
+      }
+    } catch (err) { console.error('WS parse error:', err); }
+  };
+
+  ws.onclose = () => {
+    $('heartbeat').classList.add('disconnected');
+    console.log(`WS disconnected, retrying in ${wsRetryMs}ms`);
+    setTimeout(connectWs, wsRetryMs);
+    wsRetryMs = Math.min(wsRetryMs * 2, 30000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// ─── Fallback polling ──────────────────────────────
+
+setInterval(() => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    fetch('/api/status').then(r => r.json()).then(updateStats).catch(() => {});
+    fetch('/api/positions').then(r => r.json()).then(renderPositions).catch(() => {});
+    fetch('/api/weather').then(r => r.json()).then(renderWeather).catch(() => {});
+    fetch('/api/opportunities').then(r => r.json()).then(renderOpportunities).catch(() => {});
+  }
+}, 30000);
+
+// ─── Init ──────────────────────────────────────────
+
+fetchAll();
+connectWs();
+</script>
 </body>
 </html>

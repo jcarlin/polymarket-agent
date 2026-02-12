@@ -28,6 +28,34 @@ pub struct PositionRow {
     pub question: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WeatherSnapshotRow {
+    pub cycle_number: i64,
+    pub city: String,
+    pub forecast_date: String,
+    pub ensemble_mean: f64,
+    pub ensemble_std: f64,
+    pub gefs_count: i32,
+    pub ecmwf_count: i32,
+    pub bucket_data: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpportunityRow {
+    pub cycle_number: i64,
+    pub condition_id: String,
+    pub question: String,
+    pub side: String,
+    pub market_price: f64,
+    pub estimated_probability: f64,
+    pub edge: f64,
+    pub confidence: f64,
+    pub status: String,
+    pub reject_reason: Option<String>,
+    pub created_at: String,
+}
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -106,6 +134,35 @@ impl Database {
             )
             .context("Failed to get API cost since")?;
         Ok(cost)
+    }
+
+    /// Insert or update a market record. Called after scanning so that FK constraints
+    /// on trades/positions are satisfied when executing.
+    pub fn upsert_market(&self, market: &crate::market_scanner::GammaMarket) -> Result<()> {
+        let yes_token = market.tokens.iter().find(|t| t.outcome == "Yes");
+        let no_token = market.tokens.iter().find(|t| t.outcome == "No");
+        self.conn.execute(
+            "INSERT INTO markets (condition_id, question, slug, yes_token_id, no_token_id, volume, liquidity, end_date, active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(condition_id) DO UPDATE SET
+                question = excluded.question,
+                volume = excluded.volume,
+                liquidity = excluded.liquidity,
+                active = excluded.active,
+                updated_at = datetime('now')",
+            rusqlite::params![
+                market.condition_id.as_deref().unwrap_or(""),
+                market.question,
+                market.slug,
+                yes_token.map(|t| t.token_id.as_str()),
+                no_token.map(|t| t.token_id.as_str()),
+                market.volume,
+                market.liquidity,
+                market.end_date,
+                market.active,
+            ],
+        ).context("Failed to upsert market")?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -422,6 +479,155 @@ impl Database {
         Ok(())
     }
 
+    /// Insert a weather snapshot for the current cycle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_weather_snapshot(
+        &self,
+        cycle_number: i64,
+        city: &str,
+        forecast_date: &str,
+        ensemble_mean: f64,
+        ensemble_std: f64,
+        gefs_count: i32,
+        ecmwf_count: i32,
+        bucket_data: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO weather_snapshots (cycle_number, city, forecast_date, ensemble_mean, ensemble_std, gefs_count, ecmwf_count, bucket_data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![cycle_number, city, forecast_date, ensemble_mean, ensemble_std, gefs_count, ecmwf_count, bucket_data],
+        ).context("Failed to insert weather snapshot")?;
+        Ok(())
+    }
+
+    /// Get weather snapshots from the latest cycle.
+    pub fn get_latest_weather_snapshots(&self) -> Result<Vec<WeatherSnapshotRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cycle_number, city, forecast_date, ensemble_mean, ensemble_std, gefs_count, ecmwf_count, bucket_data, created_at \
+             FROM weather_snapshots \
+             WHERE cycle_number = (SELECT MAX(cycle_number) FROM weather_snapshots) \
+             ORDER BY city",
+        ).context("Failed to prepare weather snapshots query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WeatherSnapshotRow {
+                    cycle_number: row.get(0)?,
+                    city: row.get(1)?,
+                    forecast_date: row.get(2)?,
+                    ensemble_mean: row.get(3)?,
+                    ensemble_std: row.get(4)?,
+                    gefs_count: row.get(5)?,
+                    ecmwf_count: row.get(6)?,
+                    bucket_data: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })
+            .context("Failed to query weather snapshots")?;
+        let mut snapshots = Vec::new();
+        for row in rows {
+            snapshots.push(row.context("Failed to read weather snapshot row")?);
+        }
+        Ok(snapshots)
+    }
+
+    /// Check if there's already an open position for a given market condition_id (any side).
+    pub fn has_open_position(&self, market_condition_id: &str) -> bool {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM positions WHERE market_condition_id = ?1 AND status = 'open'",
+                rusqlite::params![market_condition_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        count > 0
+    }
+
+    /// Update the estimated_probability for an open position.
+    pub fn update_position_estimate(
+        &self,
+        market_condition_id: &str,
+        estimated_probability: f64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE positions SET estimated_probability = ?1, updated_at = datetime('now') \
+                 WHERE market_condition_id = ?2 AND status = 'open'",
+                rusqlite::params![estimated_probability, market_condition_id],
+            )
+            .context("Failed to update position estimate")?;
+        Ok(())
+    }
+
+    /// Get total weather losses for today (approximate via bankroll_log description matching).
+    pub fn get_weather_losses_today(&self) -> f64 {
+        let loss: f64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(ABS(amount)), 0.0) FROM bankroll_log \
+                 WHERE entry_type = 'trade' AND amount < 0 \
+                 AND (description LIKE '%temperature%' OR description LIKE '%weather%') \
+                 AND DATE(created_at) = DATE('now')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        loss
+    }
+
+    /// Insert an opportunity from edge detection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_opportunity(
+        &self,
+        cycle_number: i64,
+        condition_id: &str,
+        question: &str,
+        side: &str,
+        market_price: f64,
+        estimated_probability: f64,
+        edge: f64,
+        confidence: f64,
+        status: &str,
+        reject_reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cycle_opportunities (cycle_number, condition_id, question, side, market_price, estimated_probability, edge, confidence, status, reject_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![cycle_number, condition_id, question, side, market_price, estimated_probability, edge, confidence, status, reject_reason],
+        ).context("Failed to insert opportunity")?;
+        Ok(())
+    }
+
+    /// Get recent opportunities, sorted by cycle desc then edge desc.
+    pub fn get_recent_opportunities(&self, limit: i64) -> Result<Vec<OpportunityRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cycle_number, condition_id, question, side, market_price, estimated_probability, edge, confidence, status, reject_reason, created_at \
+             FROM cycle_opportunities \
+             ORDER BY cycle_number DESC, edge DESC \
+             LIMIT ?1",
+        ).context("Failed to prepare opportunities query")?;
+        let rows = stmt
+            .query_map([limit], |row| {
+                Ok(OpportunityRow {
+                    cycle_number: row.get(0)?,
+                    condition_id: row.get(1)?,
+                    question: row.get(2)?,
+                    side: row.get(3)?,
+                    market_price: row.get(4)?,
+                    estimated_probability: row.get(5)?,
+                    edge: row.get(6)?,
+                    confidence: row.get(7)?,
+                    status: row.get(8)?,
+                    reject_reason: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })
+            .context("Failed to query opportunities")?;
+        let mut opps = Vec::new();
+        for row in rows {
+            opps.push(row.context("Failed to read opportunity row")?);
+        }
+        Ok(opps)
+    }
+
     pub fn get_next_cycle_number(&self) -> Result<i64> {
         let n: i64 = self
             .conn
@@ -577,6 +783,34 @@ impl Database {
                 details TEXT,
                 action_taken TEXT,
                 cycle_number INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS weather_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_number INTEGER NOT NULL,
+                city TEXT NOT NULL,
+                forecast_date TEXT NOT NULL,
+                ensemble_mean REAL NOT NULL,
+                ensemble_std REAL NOT NULL,
+                gefs_count INTEGER NOT NULL,
+                ecmwf_count INTEGER NOT NULL,
+                bucket_data TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS cycle_opportunities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_number INTEGER NOT NULL,
+                condition_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                side TEXT NOT NULL,
+                market_price REAL NOT NULL,
+                estimated_probability REAL NOT NULL,
+                edge REAL NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL,
+                reject_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             ",
@@ -1037,5 +1271,59 @@ mod tests {
         .unwrap();
         let cost = db.get_api_cost_since(1).unwrap();
         assert!(cost > 0.0);
+    }
+
+    #[test]
+    fn test_has_open_position() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        assert!(!db.has_open_position("0xcond1"));
+
+        db.upsert_position("0xcond1", "tok1", "YES", 0.60, 10.0)
+            .unwrap();
+        assert!(db.has_open_position("0xcond1"));
+
+        // Close and check again
+        db.close_position("0xcond1", "YES", 0.70).unwrap();
+        assert!(!db.has_open_position("0xcond1"));
+    }
+
+    #[test]
+    fn test_update_position_estimate() {
+        let db = Database::open_in_memory().unwrap();
+        insert_test_market(&db, "0xcond1");
+        db.upsert_position_with_estimate("0xcond1", "tok1", "YES", 0.60, 10.0, Some(0.75))
+            .unwrap();
+
+        db.update_position_estimate("0xcond1", 0.82).unwrap();
+
+        let positions = db.get_open_positions().unwrap();
+        assert_eq!(positions.len(), 1);
+        assert!((positions[0].estimated_probability.unwrap() - 0.82).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_get_weather_losses_today() {
+        let db = Database::open_in_memory().unwrap();
+        // No losses initially
+        assert!((db.get_weather_losses_today() - 0.0).abs() < f64::EPSILON);
+
+        // Add a weather-related loss
+        db.log_bankroll_entry(
+            "trade",
+            -2.50,
+            47.50,
+            "Paper loss: NYC high temperature 34-35°F",
+        )
+        .unwrap();
+
+        let losses = db.get_weather_losses_today();
+        assert!((losses - 2.50).abs() < f64::EPSILON);
+
+        // Non-weather loss should not count
+        db.log_bankroll_entry("trade", -1.00, 46.50, "Paper loss: Bitcoin market")
+            .unwrap();
+        let losses = db.get_weather_losses_today();
+        assert!((losses - 2.50).abs() < f64::EPSILON);
     }
 }

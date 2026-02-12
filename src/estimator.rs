@@ -564,7 +564,7 @@ mod tests {
 
     fn sample_market() -> GammaMarket {
         GammaMarket {
-            id: 1,
+            id: "1".to_string(),
             question: "Will it rain in NYC tomorrow?".to_string(),
             slug: Some("rain-nyc".to_string()),
             condition_id: Some("0xcond1".to_string()),
@@ -586,7 +586,7 @@ mod tests {
             closed: false,
             active: true,
             tags: vec![Tag {
-                id: Some(100381),
+                id: Some(84),
                 label: Some("Weather".to_string()),
             }],
         }
