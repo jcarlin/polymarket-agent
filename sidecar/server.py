@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from polymarket_client import PolymarketClient
+from weather.calibration import get_calibration, get_db_connection, log_validation, run_nightly_calibration
 from weather.hrrr import fetch_hrrr_temperature, is_available as hrrr_is_available, is_same_day
 from weather.nbm import fetch_nbm_percentiles, is_available as nbm_is_available, nbm_anchor_and_spread
 from weather.nws import fetch_nws_forecast
@@ -191,9 +192,21 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
     if hrrr_anchor_val is not None:
         effective_nbm_anchor = hrrr_anchor_val
 
+    # Check for per-city calibration (overrides global spread correction)
+    effective_spread = WEATHER_SPREAD_CORRECTION
+    try:
+        cal_db = get_db_connection()
+        cal = get_calibration(cal_db, city)
+        if cal is not None:
+            effective_spread = cal.spread_factor
+            logger.debug("Using calibrated spread=%.2f for %s", effective_spread, city)
+        cal_db.close()
+    except Exception as e:
+        logger.debug("Calibration lookup failed for %s: %s", city, e)
+
     probs = compute_bucket_probabilities(
         forecast,
-        spread_correction=WEATHER_SPREAD_CORRECTION,
+        spread_correction=effective_spread,
         nws_anchor=nws_high,
         nbm_anchor=effective_nbm_anchor,
         nbm_spread=nbm_spread_val,
@@ -284,6 +297,14 @@ async def weather_validation(city: str, date: str) -> WeatherValidationResponse:
     if wu_high is not None and ensemble_corrected_mean is not None:
         error_vs_wu = ensemble_corrected_mean - wu_high
 
+    # Log validation data for calibration pipeline
+    try:
+        cal_db = get_db_connection()
+        log_validation(cal_db, city, date, wu_high, nws_high, ensemble_raw_mean, ensemble_corrected_mean)
+        cal_db.close()
+    except Exception as e:
+        logger.debug("Validation logging failed: %s", e)
+
     return WeatherValidationResponse(
         city=city,
         date=date,
@@ -293,6 +314,38 @@ async def weather_validation(city: str, date: str) -> WeatherValidationResponse:
         ensemble_corrected_mean=ensemble_corrected_mean,
         error_vs_wu=error_vs_wu,
     )
+
+
+class CalibrationResponse(BaseModel):
+    cities_calibrated: int
+    cities_total: int
+    results: dict[str, dict]
+
+
+@app.post("/weather/calibrate", response_model=CalibrationResponse)
+async def trigger_calibration() -> CalibrationResponse:
+    """Trigger nightly calibration for all cities."""
+    try:
+        cal_db = get_db_connection()
+        cities = list(CITY_CONFIGS.keys())
+        results = run_nightly_calibration(cal_db, cities)
+        cal_db.close()
+
+        return CalibrationResponse(
+            cities_calibrated=len(results),
+            cities_total=len(cities),
+            results={
+                city: {
+                    "mean_bias": cal.mean_bias,
+                    "spread_factor": cal.spread_factor,
+                    "sample_count": cal.sample_count,
+                }
+                for city, cal in results.items()
+            },
+        )
+    except Exception as e:
+        logger.error("Calibration failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
