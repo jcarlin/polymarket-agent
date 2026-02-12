@@ -17,9 +17,10 @@ SIDECAR_PORT = int(os.getenv("SIDECAR_PORT", "9090"))
 TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 WEATHER_SPREAD_CORRECTION = float(os.getenv("WEATHER_SPREAD_CORRECTION", "1.3"))
 WEATHER_NBM_WEIGHT = float(os.getenv("WEATHER_NBM_WEIGHT", "0.6"))
-WEATHER_NWS_WEIGHT = float(os.getenv("WEATHER_NWS_WEIGHT", "0.6"))
+WEATHER_NWS_WEIGHT = float(os.getenv("WEATHER_NWS_WEIGHT", "0.85"))
 WEATHER_HRRR_WEIGHT = float(os.getenv("WEATHER_HRRR_WEIGHT", "0.3"))
-WEATHER_DEFAULT_BIAS_OFFSET = float(os.getenv("WEATHER_DEFAULT_BIAS_OFFSET", "0.0"))
+WEATHER_WU_FORECAST_WEIGHT = float(os.getenv("WEATHER_WU_FORECAST_WEIGHT", "0.25"))
+WEATHER_DEFAULT_BIAS_OFFSET = float(os.getenv("WEATHER_DEFAULT_BIAS_OFFSET", "4.0"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/polymarket-agent.db")
 
 # Global client instance — initialized at startup
@@ -146,6 +147,8 @@ class WeatherResponse(BaseModel):
     calibration_bias: float | None = None
     calibration_spread: float | None = None
     wu_high: float | None = None
+    wu_forecast_high: float | None = None
+    wu_forecast_shift: float = 0.0
 
 
 class WUActualResponse(BaseModel):
@@ -246,6 +249,18 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
     except Exception as e:
         logger.debug("WU fetch for %s/%s: %s", city, date, e)
 
+    # Fetch WU forecast high (for future/today dates within 5-day window)
+    wu_forecast_high = None
+    try:
+        from weather.wu_scraper import fetch_wu_forecast
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if date >= today:
+            wu_forecast_high = await fetch_wu_forecast(city, date)
+    except ImportError:
+        logger.debug("WU forecast not available")
+    except Exception as e:
+        logger.debug("WU forecast fetch for %s/%s: %s", city, date, e)
+
     # Determine calibration bias: per-city from calibration data, else default
     cal_bias = None
     cal_spread = None
@@ -268,6 +283,8 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
         hrrr_weight=WEATHER_HRRR_WEIGHT,
         calibration_bias=cal_bias,
         calibration_spread=cal_spread,
+        wu_forecast_high=wu_forecast_high,
+        wu_forecast_weight=WEATHER_WU_FORECAST_WEIGHT,
     )
 
     # Try NBM blending (optional — graceful degradation if herbie not installed)
@@ -323,6 +340,8 @@ async def weather_probabilities(city: str, date: str, same_day: bool = False) ->
         calibration_bias=probs.calibration_bias,
         calibration_spread=probs.calibration_spread,
         wu_high=wu_high,
+        wu_forecast_high=probs.wu_forecast_high,
+        wu_forecast_shift=probs.wu_forecast_shift,
     )
 
 

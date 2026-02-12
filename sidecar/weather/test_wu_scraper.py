@@ -3,14 +3,19 @@
 from unittest.mock import AsyncMock
 
 import httpx
+import numpy as np
 import pytest
 
 from weather.wu_scraper import (
     _extract_daily_high,
     _wu_cache,
+    _wu_forecast_cache,
     fetch_wu_actual,
+    fetch_wu_forecast,
     icao_to_wu_path,
     _build_api_url,
+    _build_forecast_api_url,
+    _extract_forecast_highs,
 )
 
 
@@ -185,3 +190,154 @@ async def test_fetch_wu_actual_caches_result():
     mock_client.get.assert_not_called()
 
     _wu_cache.clear()
+
+
+# ═══════════════════════════════════════════════════
+# WU Forecast tests
+# ═══════════════════════════════════════════════════
+
+
+def test_build_forecast_api_url():
+    """Forecast URL should use geocode (lat,lon) and v3 endpoint."""
+    url = _build_forecast_api_url(40.77, -73.87)
+    assert "geocode=40.77,-73.87" in url
+    assert "v3/wx/forecast/daily/5day" in url
+    assert "units=e" in url
+    assert "apiKey=" in url
+
+
+def test_extract_forecast_highs():
+    """Should parse 5-day forecast response into (date, temp) tuples."""
+    data = {
+        "calendarDayTemperatureMax": [41, 38, 45, 50, 47],
+        "validTimeLocal": [
+            "2026-02-13T07:00:00-0500",
+            "2026-02-14T07:00:00-0500",
+            "2026-02-15T07:00:00-0500",
+            "2026-02-16T07:00:00-0500",
+            "2026-02-17T07:00:00-0500",
+        ],
+    }
+    result = _extract_forecast_highs(data)
+    assert len(result) == 5
+    assert result[0] == ("2026-02-13", 41.0)
+    assert result[2] == ("2026-02-15", 45.0)
+    assert result[4] == ("2026-02-17", 47.0)
+
+
+def test_extract_forecast_highs_with_nulls():
+    """Should skip days with null temperatures."""
+    data = {
+        "calendarDayTemperatureMax": [41, None, 45, None, 47],
+        "validTimeLocal": [
+            "2026-02-13T07:00:00-0500",
+            "2026-02-14T07:00:00-0500",
+            "2026-02-15T07:00:00-0500",
+            "2026-02-16T07:00:00-0500",
+            "2026-02-17T07:00:00-0500",
+        ],
+    }
+    result = _extract_forecast_highs(data)
+    assert len(result) == 3
+    dates = [r[0] for r in result]
+    assert "2026-02-14" not in dates
+    assert "2026-02-16" not in dates
+
+
+def test_extract_forecast_highs_empty():
+    """Should return empty list for missing/empty data."""
+    assert _extract_forecast_highs({}) == []
+    assert _extract_forecast_highs({"calendarDayTemperatureMax": []}) == []
+    assert _extract_forecast_highs({"validTimeLocal": []}) == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_wu_forecast_success():
+    """Should fetch forecast and cache all 5 days."""
+    _wu_forecast_cache.clear()
+
+    api_response = {
+        "calendarDayTemperatureMax": [41, 38, 45, 50, 47],
+        "validTimeLocal": [
+            "2026-02-13T07:00:00-0500",
+            "2026-02-14T07:00:00-0500",
+            "2026-02-15T07:00:00-0500",
+            "2026-02-16T07:00:00-0500",
+            "2026-02-17T07:00:00-0500",
+        ],
+    }
+
+    mock_response = AsyncMock()
+    mock_response.status_code = 200
+    mock_response.json = lambda: api_response
+    mock_response.raise_for_status = lambda: None
+
+    mock_client = AsyncMock(spec=httpx.AsyncClient)
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.aclose = AsyncMock()
+
+    result = await fetch_wu_forecast("NYC", "2026-02-13", client=mock_client)
+    assert result == 41.0
+
+    # All 5 days should be cached
+    assert ("NYC", "2026-02-13") in _wu_forecast_cache
+    assert ("NYC", "2026-02-14") in _wu_forecast_cache
+    assert ("NYC", "2026-02-15") in _wu_forecast_cache
+    assert _wu_forecast_cache[("NYC", "2026-02-15")] == 45.0
+
+    _wu_forecast_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_fetch_wu_forecast_cache_hit():
+    """Cached value should be returned without API call."""
+    _wu_forecast_cache.clear()
+    _wu_forecast_cache[("NYC", "2026-02-13")] = 42.0
+
+    mock_client = AsyncMock(spec=httpx.AsyncClient)
+    mock_client.get = AsyncMock()
+
+    result = await fetch_wu_forecast("NYC", "2026-02-13", client=mock_client)
+    assert result == 42.0
+    mock_client.get.assert_not_called()
+
+    _wu_forecast_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_fetch_wu_forecast_unknown_city():
+    """Unknown city should return None without making HTTP request."""
+    _wu_forecast_cache.clear()
+    result = await fetch_wu_forecast("UNKNOWN_CITY", "2026-02-13")
+    assert result is None
+    _wu_forecast_cache.clear()
+
+
+def test_wu_forecast_anchoring():
+    """WU forecast anchoring should shift ensemble mean toward WU forecast."""
+    from weather.open_meteo import EnsembleForecast
+    from weather.probability_model import compute_bucket_probabilities
+
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(37.0, 3.0, 82))
+    forecast = EnsembleForecast(
+        city="NYC",
+        station_icao="KLGA",
+        forecast_date="2026-02-13",
+        gefs_daily_max=members[:31],
+        ecmwf_daily_max=members[31:],
+        all_members=members,
+    )
+
+    result_no_wu = compute_bucket_probabilities(forecast)
+    result_with_wu = compute_bucket_probabilities(
+        forecast, wu_forecast_high=45.0, wu_forecast_weight=0.5
+    )
+
+    # With WU forecast=45 and weight=0.5, mean should shift toward 45
+    assert result_with_wu.ensemble_mean > result_no_wu.ensemble_mean, (
+        f"WU forecast should shift mean upward: "
+        f"{result_with_wu.ensemble_mean} vs {result_no_wu.ensemble_mean}"
+    )
+    assert result_with_wu.wu_forecast_high == 45.0
+    assert result_with_wu.wu_forecast_shift > 0

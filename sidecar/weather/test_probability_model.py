@@ -160,9 +160,9 @@ def test_nws_bias_correction():
     forecast = _make_forecast(members)
     raw_mean = float(np.mean(members))
     nws = 37.0
-    # Default weight=0.6: target = 0.6*37 + 0.4*raw_mean
+    # Default weight=0.85: target = 0.85*37 + 0.15*raw_mean
     result = compute_bucket_probabilities(forecast, nws_high=nws)
-    expected_target = 0.6 * nws + 0.4 * raw_mean
+    expected_target = 0.85 * nws + 0.15 * raw_mean
     assert abs(result.ensemble_mean - expected_target) < 0.5, (
         f"Corrected ensemble_mean {result.ensemble_mean} should be ~{expected_target:.1f} (weighted blend)"
     )

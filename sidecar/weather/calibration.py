@@ -17,7 +17,7 @@ class CalibrationParams:
     sample_size: int
 
 
-MIN_OBSERVATIONS = 20
+MIN_OBSERVATIONS = 5
 SPREAD_FACTOR_MIN = 0.8
 SPREAD_FACTOR_MAX = 2.0
 
@@ -26,9 +26,13 @@ def compute_calibration(db_path: str) -> dict[str, CalibrationParams]:
     """Compute per-city calibration parameters from weather_actuals table.
 
     Reads rows from the weather_actuals table with columns:
-        city, date, wu_actual_high, ensemble_mean
+        city, date, wu_actual_high, ensemble_mean, nws_forecast_high
 
-    Only calibrates cities with >= 20 observations.
+    When nws_forecast_high is available for a row, computes bias as
+    actual - nws_high (residual after NWS correction). Otherwise falls
+    back to actual - ensemble_mean.
+
+    Only calibrates cities with >= MIN_OBSERVATIONS observations.
 
     Returns:
         Dict mapping city code to CalibrationParams.
@@ -39,7 +43,8 @@ def compute_calibration(db_path: str) -> dict[str, CalibrationParams]:
         cursor = conn.cursor()
 
         cursor.execute(
-            "SELECT city, wu_actual_high, ensemble_mean FROM weather_actuals"
+            "SELECT city, wu_actual_high, ensemble_mean, nws_forecast_high "
+            "FROM weather_actuals"
         )
         rows = cursor.fetchall()
         conn.close()
@@ -47,12 +52,16 @@ def compute_calibration(db_path: str) -> dict[str, CalibrationParams]:
         logger.warning("Failed to read weather_actuals: %s", e)
         return {}
 
-    # Group by city
+    # Group by city: (actual, predicted) where predicted = nws_high if available, else ensemble_mean
     city_data: dict[str, list[tuple[float, float]]] = {}
     for row in rows:
         city = row["city"]
         actual = row["wu_actual_high"]
-        predicted = row["ensemble_mean"]
+        # Prefer NWS forecast as the prediction anchor (since NWS dominates the blend).
+        # This way calibration captures the residual *after* NWS correction.
+        nws_high = row["nws_forecast_high"]
+        ensemble = row["ensemble_mean"]
+        predicted = nws_high if nws_high is not None else ensemble
         if actual is None or predicted is None:
             continue
         city_data.setdefault(city, []).append((float(actual), float(predicted)))

@@ -111,6 +111,10 @@ pub struct WeatherProbabilities {
     pub calibration_spread: Option<f64>,
     #[serde(default)]
     pub wu_high: Option<f64>,
+    #[serde(default)]
+    pub wu_forecast_high: Option<f64>,
+    #[serde(default)]
+    pub wu_forecast_shift: f64,
 }
 
 /// Parsed weather market info from Polymarket question text

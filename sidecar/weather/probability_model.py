@@ -40,6 +40,8 @@ class WeatherProbabilities:
     nbm_percentiles: Optional[dict] = None
     calibration_bias: Optional[float] = None
     calibration_spread: Optional[float] = None
+    wu_forecast_high: Optional[float] = None
+    wu_forecast_shift: float = 0.0
 
 
 def compute_bucket_probabilities(
@@ -48,11 +50,13 @@ def compute_bucket_probabilities(
     bucket_width: float = 2.0,
     spread_correction: float = 1.0,
     nws_high: Optional[float] = None,
-    nws_weight: float = 0.6,
+    nws_weight: float = 0.85,
     hrrr_max: Optional[float] = None,
     hrrr_weight: float = 0.3,
     calibration_bias: Optional[float] = None,
     calibration_spread: Optional[float] = None,
+    wu_forecast_high: Optional[float] = None,
+    wu_forecast_weight: float = 0.5,
 ) -> WeatherProbabilities:
     """Convert ensemble member temperatures to bucket probabilities using Gaussian KDE."""
     members = np.array(forecast.all_members, dtype=np.float64)
@@ -89,6 +93,15 @@ def compute_bucket_probabilities(
         members = members + hrrr_shift
         logger.info("HRRR anchoring: shift=%.1f°F (weight=%.1f, hrrr=%.1f, mean=%.1f)",
                      hrrr_shift, hrrr_weight, hrrr_max, corrected_mean)
+
+    # WU forecast anchoring: nudge distribution toward WU's own forecast (resolution source)
+    wu_fcst_shift = 0.0
+    if wu_forecast_high is not None and wu_forecast_weight > 0:
+        corrected_mean = float(np.mean(members))
+        wu_fcst_shift = wu_forecast_weight * (wu_forecast_high - corrected_mean)
+        members = members + wu_fcst_shift
+        logger.info("WU forecast anchoring: shift=%.1f°F (weight=%.1f, wu_fcst=%.1f, mean=%.1f)",
+                     wu_fcst_shift, wu_forecast_weight, wu_forecast_high, corrected_mean)
 
     mean = float(np.mean(members))  # corrected mean
     std = float(np.std(members)) if len(members) > 1 else 0.0
@@ -165,6 +178,8 @@ def compute_bucket_probabilities(
         hrrr_shift=hrrr_shift,
         calibration_bias=calibration_bias,
         calibration_spread=calibration_spread,
+        wu_forecast_high=wu_forecast_high,
+        wu_forecast_shift=wu_fcst_shift,
     )
 
 

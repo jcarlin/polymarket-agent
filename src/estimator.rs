@@ -391,6 +391,12 @@ impl Estimator {
                 ));
             }
         }
+        if let Some(wu_fcst) = wx.probs.wu_forecast_high {
+            block.push_str(&format!(
+                "- **WU forecast high (resolution source):** {:.0}°F\n",
+                wu_fcst
+            ));
+        }
         if let Some(mp) = wx.model_probability {
             block.push_str(&format!(
                 "- **Model probability for this outcome:** {:.1}%\n",

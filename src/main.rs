@@ -54,6 +54,13 @@ async fn main() -> Result<()> {
         .init();
 
     info!("Polymarket Agent starting in {} mode", config.trading_mode);
+    info!(
+        "Config: weather_daily_loss_limit=${:.2}, max_total_weather_exposure={:.0}%, kelly_fraction={}, trading_mode={}",
+        config.weather_daily_loss_limit,
+        config.max_total_weather_exposure_pct * 100.0,
+        config.kelly_fraction,
+        config.trading_mode,
+    );
 
     // Open database
     let db = Database::open(&config.database_path)?;
@@ -247,10 +254,11 @@ async fn main() -> Result<()> {
                         match wc.get_probabilities(&info.city, &info.date, is_same_day).await {
                             Ok(probs) => {
                                 info!(
-                                    "Weather {}/{}: ensemble={:.1}°F, NWS={}, WU={}{} → to_llm={:.1}°F | std={:.1}°F, {} members, cal_bias={}",
+                                    "Weather {}/{}: ensemble={:.1}°F, NWS={}, WU_fcst={}, WU_actual={}{} → to_llm={:.1}°F | std={:.1}°F, {} members, cal_bias={}",
                                     info.city, info.date,
                                     probs.raw_ensemble_mean,
                                     probs.nws_forecast_high.map_or("n/a".to_string(), |h| format!("{:.0}°F", h)),
+                                    probs.wu_forecast_high.map_or("n/a".to_string(), |h| format!("{:.0}°F", h)),
                                     probs.wu_high.map_or("n/a".to_string(), |h| format!("{:.0}°F", h)),
                                     probs.hrrr_max_temp.map_or(String::new(), |h| format!(", HRRR={:.0}°F", h)),
                                     probs.ensemble_mean,

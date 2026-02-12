@@ -95,7 +95,10 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        dotenvy::dotenv().ok(); // Don't fail if .env missing
+        match dotenvy::dotenv() {
+            Ok(path) => eprintln!("[config] Loaded .env from {}", path.display()),
+            Err(e) => eprintln!("[config] No .env loaded: {}", e),
+        }
 
         Ok(Config {
             trading_mode: env::var("TRADING_MODE")
