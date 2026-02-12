@@ -18,8 +18,8 @@ use polymarket_agent::position_manager::PositionManager;
 use polymarket_agent::position_sizer::PositionSizer;
 use polymarket_agent::sidecar::SidecarProcess;
 use polymarket_agent::weather_client::{
-    get_weather_model_probability, parse_weather_market, WeatherClient,
-    WeatherProbabilities, WEATHER_CITY_CODES,
+    get_weather_model_probability, parse_weather_market, WeatherClient, WeatherProbabilities,
+    WEATHER_CITY_CODES,
 };
 use polymarket_agent::websocket::{new_event_channel, DashboardEvent};
 
@@ -150,7 +150,9 @@ async fn main() -> Result<()> {
         "Starting recurring loop at cycle {} (bankroll: ${:.2}){}",
         cycle_number,
         db.get_current_bankroll()?,
-        config.max_cycles.map_or(String::new(), |n| format!(", max {} cycles", n)),
+        config
+            .max_cycles
+            .map_or(String::new(), |n| format!(", max {} cycles", n)),
     );
 
     // ═══════════════════════════════════════
@@ -468,10 +470,7 @@ async fn main() -> Result<()> {
 
             // No re-buy: skip if already positioned in this market (weather-only)
             if is_weather_opp && db.has_open_position(&opp.market_id) {
-                info!(
-                    "Skipping {} — already have open position",
-                    opp.question,
-                );
+                info!("Skipping {} — already have open position", opp.question,);
                 let _ = db.conn.execute(
                     "UPDATE cycle_opportunities SET status = 'rejected', reject_reason = 'already_positioned' WHERE cycle_number = ?1 AND condition_id = ?2 AND status = 'pending'",
                     rusqlite::params![cycle_number, opp.market_id],
@@ -515,17 +514,22 @@ async fn main() -> Result<()> {
             // Time-based sizing for weather markets
             let days_until = if is_weather_opp {
                 parse_weather_market(&opp.question).and_then(|info| {
-                    NaiveDate::parse_from_str(&info.date, "%Y-%m-%d").ok().map(|d| {
-                        let today = Utc::now().date_naive();
-                        (d - today).num_days()
-                    })
+                    NaiveDate::parse_from_str(&info.date, "%Y-%m-%d")
+                        .ok()
+                        .map(|d| {
+                            let today = Utc::now().date_naive();
+                            (d - today).num_days()
+                        })
                 })
             } else {
                 None
             };
 
             let sizing = effective_sizer.size_position_with_time(
-                opp, bankroll, current_exposure, days_until,
+                opp,
+                bankroll,
+                current_exposure,
+                days_until,
             );
             if sizing.is_rejected() {
                 info!(
