@@ -63,8 +63,8 @@ pub fn city_slug(code: &str) -> Option<&'static str> {
 
 /// All unique city codes (deduplicated from CITY_PATTERNS).
 pub const WEATHER_CITY_CODES: &[&str] = &[
-    "NYC", "LAX", "CHI", "HOU", "PHX", "PHL", "SAN", "SDG", "DAL", "SJC",
-    "ATL", "MIA", "BOS", "SEA", "DEN", "DCA", "MSP", "DTW", "TPA", "STL",
+    "NYC", "LAX", "CHI", "HOU", "PHX", "PHL", "SAN", "SDG", "DAL", "SJC", "ATL", "MIA", "BOS",
+    "SEA", "DEN", "DCA", "MSP", "DTW", "TPA", "STL",
 ];
 
 /// Probability for a single temperature bucket
@@ -77,7 +77,7 @@ pub struct BucketProbability {
 }
 
 /// Full weather probability response from sidecar
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct WeatherProbabilities {
     pub city: String,
     pub station_icao: String,
@@ -87,6 +87,24 @@ pub struct WeatherProbabilities {
     pub ensemble_std: f64,
     pub gefs_count: u32,
     pub ecmwf_count: u32,
+    #[serde(default)]
+    pub nws_forecast_high: Option<f64>,
+    #[serde(default)]
+    pub bias_correction: f64,
+    #[serde(default)]
+    pub raw_ensemble_mean: f64,
+    #[serde(default)]
+    pub icon_count: u32,
+    #[serde(default)]
+    pub gem_count: u32,
+    #[serde(default)]
+    pub total_members: u32,
+    #[serde(default)]
+    pub hrrr_max_temp: Option<f64>,
+    #[serde(default)]
+    pub hrrr_shift: f64,
+    #[serde(default)]
+    pub nbm_max_temp: Option<f64>,
 }
 
 /// Parsed weather market info from Polymarket question text
@@ -608,6 +626,7 @@ mod tests {
             ensemble_std: 2.0,
             gefs_count: 31,
             ecmwf_count: 51,
+            ..Default::default()
         };
 
         let info = WeatherMarketInfo {
@@ -652,6 +671,7 @@ mod tests {
             ensemble_std: 3.0,
             gefs_count: 31,
             ecmwf_count: 51,
+            ..Default::default()
         };
 
         let info = WeatherMarketInfo {

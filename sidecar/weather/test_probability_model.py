@@ -3,20 +3,31 @@
 import numpy as np
 from weather.open_meteo import EnsembleForecast
 from weather.probability_model import (
+    blend_probabilities,
+    BucketProbability,
     compute_bucket_probabilities,
 )
 
 
-def _make_forecast(members: list[float]) -> EnsembleForecast:
+def _make_forecast(
+    members: list[float],
+    icon: list[float] | None = None,
+    gem: list[float] | None = None,
+) -> EnsembleForecast:
     """Helper to create a forecast with given member temps."""
     n_gefs = min(31, len(members))
+    icon_list = icon or []
+    gem_list = gem or []
+    all_members = members + icon_list + gem_list
     return EnsembleForecast(
         city="NYC",
         station_icao="KLGA",
         forecast_date="2026-01-15",
         gefs_daily_max=members[:n_gefs],
         ecmwf_daily_max=members[n_gefs:],
-        all_members=members,
+        icon_daily_max=icon_list,
+        gem_daily_max=gem_list,
+        all_members=all_members,
     )
 
 
@@ -171,3 +182,97 @@ def test_nws_none_no_shift():
     assert abs(result.ensemble_mean - result.raw_ensemble_mean) < 1e-9, (
         "ensemble_mean should equal raw_ensemble_mean when no NWS correction"
     )
+
+
+def test_hrrr_anchoring_shifts_mean():
+    """HRRR anchoring should shift distribution toward HRRR point estimate."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(40.0, 3.0, 82))
+    forecast = _make_forecast(members)
+
+    result_no_hrrr = compute_bucket_probabilities(forecast)
+    result_with_hrrr = compute_bucket_probabilities(forecast, hrrr_max=50.0, hrrr_weight=0.3)
+
+    # With HRRR=50 and weight=0.3, mean should shift toward 50 by ~30% of the gap
+    assert result_with_hrrr.ensemble_mean > result_no_hrrr.ensemble_mean, (
+        f"HRRR should shift mean upward: {result_with_hrrr.ensemble_mean} vs {result_no_hrrr.ensemble_mean}"
+    )
+    assert result_with_hrrr.hrrr_max_temp == 50.0
+    assert result_with_hrrr.hrrr_shift > 0
+
+
+def test_hrrr_weight_zero_no_shift():
+    """HRRR with weight=0 should not shift the distribution."""
+    rng = np.random.default_rng(42)
+    members = list(rng.normal(40.0, 3.0, 82))
+    forecast = _make_forecast(members)
+
+    result_no_hrrr = compute_bucket_probabilities(forecast)
+    result_zero_weight = compute_bucket_probabilities(forecast, hrrr_max=50.0, hrrr_weight=0.0)
+
+    assert abs(result_zero_weight.ensemble_mean - result_no_hrrr.ensemble_mean) < 1e-9
+    assert result_zero_weight.hrrr_shift == 0.0
+
+
+def test_multi_model_ensemble_sum_to_one():
+    """Ensemble with ICON + GEM (>100 members) should still sum to ~1.0."""
+    rng = np.random.default_rng(42)
+    gefs = list(rng.normal(75, 3, 31))
+    ecmwf = list(rng.normal(75, 3, 51))
+    icon = list(rng.normal(75, 3, 40))
+    gem = list(rng.normal(75, 3, 21))
+
+    forecast = _make_forecast(gefs + ecmwf, icon=icon, gem=gem)
+    result = compute_bucket_probabilities(forecast)
+
+    total = sum(b.probability for b in result.buckets)
+    assert abs(total - 1.0) < 0.01, f"Total probability {total} should be ~1.0"
+    assert result.total_members == 143  # 31+51+40+21
+    assert result.icon_count == 40
+    assert result.gem_count == 21
+
+
+def test_multi_model_metadata():
+    """Multi-model forecast should report correct member counts."""
+    gefs = [70.0 + i * 0.5 for i in range(31)]
+    ecmwf = [71.0 + i * 0.3 for i in range(51)]
+    icon = [72.0 + i * 0.4 for i in range(40)]
+    gem = [73.0 + i * 0.6 for i in range(21)]
+
+    forecast = _make_forecast(gefs + ecmwf, icon=icon, gem=gem)
+    result = compute_bucket_probabilities(forecast)
+
+    assert result.gefs_count == 31
+    assert result.ecmwf_count == 51
+    assert result.icon_count == 40
+    assert result.gem_count == 21
+    assert result.total_members == 143
+
+
+def test_blend_probabilities_basic():
+    """Blending should produce weighted average of ensemble and NBM buckets."""
+    ensemble_buckets = [
+        BucketProbability("70-72", 70.0, 72.0, 0.3),
+        BucketProbability("72-74", 72.0, 74.0, 0.5),
+        BucketProbability("74-76", 74.0, 76.0, 0.2),
+    ]
+    nbm_buckets = [
+        (70.0, 72.0, 0.1),
+        (72.0, 74.0, 0.6),
+        (74.0, 76.0, 0.3),
+    ]
+
+    blended = blend_probabilities(ensemble_buckets, nbm_buckets, nbm_weight=0.6)
+    total = sum(b.probability for b in blended)
+    assert abs(total - 1.0) < 0.01
+
+
+def test_blend_probabilities_no_nbm():
+    """Blending with empty NBM should return ensemble buckets unchanged."""
+    ensemble_buckets = [
+        BucketProbability("70-72", 70.0, 72.0, 0.5),
+        BucketProbability("72-74", 72.0, 74.0, 0.5),
+    ]
+    blended = blend_probabilities(ensemble_buckets, [], nbm_weight=0.6)
+    assert len(blended) == 2
+    assert abs(blended[0].probability - 0.5) < 0.01

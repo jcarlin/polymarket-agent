@@ -10,6 +10,7 @@ import httpx
 logger = logging.getLogger("weather.open_meteo")
 
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 
 @dataclass
@@ -53,7 +54,18 @@ class EnsembleForecast:
     forecast_date: str  # YYYY-MM-DD
     gefs_daily_max: list[float] = field(default_factory=list)  # 31 members
     ecmwf_daily_max: list[float] = field(default_factory=list)  # 51 members
-    all_members: list[float] = field(default_factory=list)  # combined 82
+    icon_daily_max: list[float] = field(default_factory=list)  # ~40 members (optional)
+    gem_daily_max: list[float] = field(default_factory=list)  # ~21 members (optional)
+    all_members: list[float] = field(default_factory=list)  # combined all models
+
+
+@dataclass
+class HRRRForecast:
+    city: str
+    station_icao: str
+    forecast_date: str
+    hourly_temps_f: list[float] = field(default_factory=list)
+    max_temp_f: float = 0.0
 
 
 def _celsius_to_fahrenheit(c: float) -> float:
@@ -87,9 +99,19 @@ async def fetch_ensemble(
 
     gefs_maxes: list[float] = []
     ecmwf_maxes: list[float] = []
+    icon_maxes: list[float] = []
+    gem_maxes: list[float] = []
+
+    # Models: (name, api_param, required)
+    models = [
+        ("gefs", "gfs_seamless", True),
+        ("ecmwf", "ecmwf_ifs025", True),
+        ("icon", "icon_seamless", False),
+        ("gem", "gem_global", False),
+    ]
 
     try:
-        for model_name, model_param in [("gefs", "gfs_seamless"), ("ecmwf", "ecmwf_ifs025")]:
+        for model_name, model_param, required in models:
             last_err: Optional[Exception] = None
             resp = None
             for attempt in range(max_retries):
@@ -103,11 +125,18 @@ async def fetch_ensemble(
                     if attempt < max_retries - 1:
                         await asyncio.sleep(1.0 * (attempt + 1))
             else:
-                logger.error(
-                    "Failed to fetch %s for %s after %d retries: %s",
-                    model_name, city, max_retries, last_err,
-                )
-                return None
+                if required:
+                    logger.error(
+                        "Failed to fetch %s for %s after %d retries: %s",
+                        model_name, city, max_retries, last_err,
+                    )
+                    return None
+                else:
+                    logger.warning(
+                        "Optional model %s failed for %s after %d retries: %s (continuing)",
+                        model_name, city, max_retries, last_err,
+                    )
+                    continue
 
             data = resp.json()
             daily = data.get("daily", {})
@@ -122,16 +151,22 @@ async def fetch_ensemble(
 
             if model_name == "gefs":
                 gefs_maxes = daily_maxes
-            else:
+            elif model_name == "ecmwf":
                 ecmwf_maxes = daily_maxes
+            elif model_name == "icon":
+                icon_maxes = daily_maxes
+            elif model_name == "gem":
+                gem_maxes = daily_maxes
 
-        all_members = gefs_maxes + ecmwf_maxes
+        all_members = gefs_maxes + ecmwf_maxes + icon_maxes + gem_maxes
         return EnsembleForecast(
             city=city,
             station_icao=config.icao,
             forecast_date=date,
             gefs_daily_max=gefs_maxes,
             ecmwf_daily_max=ecmwf_maxes,
+            icon_daily_max=icon_maxes,
+            gem_daily_max=gem_maxes,
             all_members=all_members,
         )
     finally:
@@ -248,6 +283,82 @@ async def fetch_nws_for_city(
         logger.warning("fetch_nws_for_city: unknown city %s", city)
         return None
     return await fetch_nws_forecast(config.lat, config.lon, date, session=session)
+
+
+async def fetch_hrrr(
+    city: str,
+    date: str,
+    session: Optional[httpx.AsyncClient] = None,
+    max_retries: int = 3,
+) -> Optional[HRRRForecast]:
+    """Fetch HRRR deterministic forecast from Open-Meteo for same-day markets.
+
+    Returns hourly temperatures and the daily max for the target date.
+    HRRR provides 3km resolution, hourly updates — much fresher than 6-hourly GEFS.
+    """
+    config = CITY_CONFIGS.get(city)
+    if config is None:
+        logger.warning("fetch_hrrr: unknown city %s", city)
+        return None
+
+    hrrr_params = {
+        "latitude": config.lat,
+        "longitude": config.lon,
+        "hourly": "temperature_2m",
+        "models": "ncep_hrrr_conus",
+        "start_date": date,
+        "end_date": date,
+        "timezone": config.timezone,
+    }
+
+    close_session = False
+    if session is None:
+        session = httpx.AsyncClient(timeout=30.0)
+        close_session = True
+
+    try:
+        last_err: Optional[Exception] = None
+        resp = None
+        for attempt in range(max_retries):
+            try:
+                resp = await session.get(OPEN_METEO_FORECAST_URL, params=hrrr_params)
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+        else:
+            logger.warning("HRRR fetch failed for %s after %d retries: %s", city, max_retries, last_err)
+            return None
+
+        data = resp.json()
+        hourly = data.get("hourly", {})
+        temps_c = hourly.get("temperature_2m", [])
+
+        if not temps_c:
+            logger.warning("HRRR returned no hourly data for %s/%s", city, date)
+            return None
+
+        # Convert to Fahrenheit, filter out None values
+        temps_f = [_celsius_to_fahrenheit(t) for t in temps_c if t is not None]
+        if not temps_f:
+            return None
+
+        max_temp = max(temps_f)
+        return HRRRForecast(
+            city=city,
+            station_icao=config.icao,
+            forecast_date=date,
+            hourly_temps_f=temps_f,
+            max_temp_f=max_temp,
+        )
+    except Exception as e:
+        logger.warning("HRRR fetch unexpected error for %s: %s", city, e)
+        return None
+    finally:
+        if close_session:
+            await session.aclose()
 
 
 async def fetch_all_cities(

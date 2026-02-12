@@ -42,6 +42,19 @@ pub struct WeatherSnapshotRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct WeatherActualRow {
+    pub city: String,
+    pub forecast_date: String,
+    pub wu_actual_high: Option<f64>,
+    pub nws_forecast_high: Option<f64>,
+    pub ensemble_mean: Option<f64>,
+    pub predicted_bucket: Option<String>,
+    pub actual_bucket: Option<String>,
+    pub prediction_error: Option<f64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct OpportunityRow {
     pub cycle_number: i64,
     pub condition_id: String,
@@ -529,6 +542,65 @@ impl Database {
         Ok(snapshots)
     }
 
+    /// Insert or replace a weather actual observation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_weather_actual(
+        &self,
+        city: &str,
+        forecast_date: &str,
+        wu_actual_high: Option<f64>,
+        nws_forecast_high: Option<f64>,
+        ensemble_mean: Option<f64>,
+        predicted_bucket: Option<&str>,
+        actual_bucket: Option<&str>,
+        prediction_error: Option<f64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO weather_actuals (city, forecast_date, wu_actual_high, nws_forecast_high, ensemble_mean, predicted_bucket, actual_bucket, prediction_error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(city, forecast_date) DO UPDATE SET
+                wu_actual_high = COALESCE(excluded.wu_actual_high, wu_actual_high),
+                nws_forecast_high = COALESCE(excluded.nws_forecast_high, nws_forecast_high),
+                ensemble_mean = COALESCE(excluded.ensemble_mean, ensemble_mean),
+                predicted_bucket = COALESCE(excluded.predicted_bucket, predicted_bucket),
+                actual_bucket = COALESCE(excluded.actual_bucket, actual_bucket),
+                prediction_error = COALESCE(excluded.prediction_error, prediction_error)",
+            rusqlite::params![city, forecast_date, wu_actual_high, nws_forecast_high, ensemble_mean, predicted_bucket, actual_bucket, prediction_error],
+        ).context("Failed to insert weather actual")?;
+        Ok(())
+    }
+
+    /// Get weather actuals for a city, ordered by date descending.
+    pub fn get_weather_actuals(&self, city: &str, limit: i64) -> Result<Vec<WeatherActualRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT city, forecast_date, wu_actual_high, nws_forecast_high, ensemble_mean, predicted_bucket, actual_bucket, prediction_error, created_at \
+             FROM weather_actuals \
+             WHERE city = ?1 \
+             ORDER BY forecast_date DESC \
+             LIMIT ?2",
+        ).context("Failed to prepare weather actuals query")?;
+        let rows = stmt
+            .query_map(rusqlite::params![city, limit], |row| {
+                Ok(WeatherActualRow {
+                    city: row.get(0)?,
+                    forecast_date: row.get(1)?,
+                    wu_actual_high: row.get(2)?,
+                    nws_forecast_high: row.get(3)?,
+                    ensemble_mean: row.get(4)?,
+                    predicted_bucket: row.get(5)?,
+                    actual_bucket: row.get(6)?,
+                    prediction_error: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })
+            .context("Failed to query weather actuals")?;
+        let mut actuals = Vec::new();
+        for row in rows {
+            actuals.push(row.context("Failed to read weather actual row")?);
+        }
+        Ok(actuals)
+    }
+
     /// Check if there's already an open position for a given market condition_id (any side).
     pub fn has_open_position(&self, market_condition_id: &str) -> bool {
         let count: i64 = self
@@ -813,6 +885,29 @@ impl Database {
                 reject_reason TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS weather_actuals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                city TEXT NOT NULL,
+                forecast_date TEXT NOT NULL,
+                wu_actual_high REAL,
+                nws_forecast_high REAL,
+                ensemble_mean REAL,
+                predicted_bucket TEXT,
+                actual_bucket TEXT,
+                prediction_error REAL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(city, forecast_date)
+            );
+
+            CREATE TABLE IF NOT EXISTS weather_calibration (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                city TEXT NOT NULL UNIQUE,
+                bias_offset REAL NOT NULL DEFAULT 0.0,
+                spread_factor REAL NOT NULL DEFAULT 1.0,
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             ",
             )
             .context("Failed to run database migrations")?;
@@ -820,6 +915,20 @@ impl Database {
         // Phase 6: Add estimated_probability column to positions (idempotent)
         let _ = self.conn.execute(
             "ALTER TABLE positions ADD COLUMN estimated_probability REAL",
+            [],
+        );
+
+        // Phase 5+: Add extra ensemble columns to weather_snapshots (idempotent)
+        let _ = self.conn.execute(
+            "ALTER TABLE weather_snapshots ADD COLUMN icon_count INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE weather_snapshots ADD COLUMN gem_count INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE weather_snapshots ADD COLUMN total_members INTEGER DEFAULT 0",
             [],
         );
 

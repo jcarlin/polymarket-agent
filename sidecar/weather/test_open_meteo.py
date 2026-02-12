@@ -4,8 +4,10 @@ import pytest
 from weather.open_meteo import (
     CITY_CONFIGS,
     EnsembleForecast,
+    HRRRForecast,
     _celsius_to_fahrenheit,
     fetch_ensemble,
+    fetch_hrrr,
     fetch_all_cities,
     fetch_nws_for_city,
 )
@@ -53,6 +55,46 @@ def test_ensemble_forecast_dataclass():
     )
     assert len(ef.all_members) == 5
     assert ef.city == "NYC"
+    # New fields should default to empty lists
+    assert ef.icon_daily_max == []
+    assert ef.gem_daily_max == []
+
+
+def test_ensemble_forecast_with_icon_gem():
+    """EnsembleForecast should support ICON and GEM members."""
+    ef = EnsembleForecast(
+        city="NYC",
+        station_icao="KLGA",
+        forecast_date="2026-01-15",
+        gefs_daily_max=[70.0] * 31,
+        ecmwf_daily_max=[71.0] * 51,
+        icon_daily_max=[72.0] * 40,
+        gem_daily_max=[73.0] * 21,
+        all_members=[70.0] * 31 + [71.0] * 51 + [72.0] * 40 + [73.0] * 21,
+    )
+    assert len(ef.all_members) == 143
+    assert len(ef.icon_daily_max) == 40
+    assert len(ef.gem_daily_max) == 21
+
+
+def test_hrrr_forecast_dataclass():
+    """HRRRForecast should store hourly temps and max."""
+    hrrr = HRRRForecast(
+        city="NYC",
+        station_icao="KLGA",
+        forecast_date="2026-02-11",
+        hourly_temps_f=[35.0, 36.0, 37.0, 38.0, 37.5],
+        max_temp_f=38.0,
+    )
+    assert hrrr.max_temp_f == 38.0
+    assert len(hrrr.hourly_temps_f) == 5
+
+
+@pytest.mark.asyncio
+async def test_fetch_hrrr_unknown_city():
+    """Unknown city should return None."""
+    result = await fetch_hrrr("UNKNOWN", "2026-01-15")
+    assert result is None
 
 
 @pytest.mark.asyncio

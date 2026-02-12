@@ -384,10 +384,7 @@ impl MarketScanner {
             .context("Failed to parse weather events response")?;
 
         // Extract all child markets from the events
-        let all_markets: Vec<GammaMarket> = events
-            .into_iter()
-            .flat_map(|e| e.markets)
-            .collect();
+        let all_markets: Vec<GammaMarket> = events.into_iter().flat_map(|e| e.markets).collect();
 
         // Filter to supported cities and date window using parse_weather_market
         let today = Utc::now().date_naive();
@@ -402,7 +399,9 @@ impl MarketScanner {
                         return false;
                     }
                     // Check date is within window
-                    if let Ok(market_date) = chrono::NaiveDate::parse_from_str(&info.date, "%Y-%m-%d") {
+                    if let Ok(market_date) =
+                        chrono::NaiveDate::parse_from_str(&info.date, "%Y-%m-%d")
+                    {
                         market_date >= today && market_date < max_date
                     } else {
                         false

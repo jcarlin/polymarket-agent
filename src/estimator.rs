@@ -729,6 +729,7 @@ mod tests {
             ensemble_std: 2.3,
             gefs_count: 31,
             ecmwf_count: 51,
+            ..Default::default()
         };
         let wx = WeatherContext {
             probs: &weather_probs,

@@ -188,7 +188,7 @@ impl Config {
                 .parse()
                 .context("Failed to parse EXECUTOR_REQUEST_TIMEOUT_SECS")?,
             weather_spread_correction: env::var("WEATHER_SPREAD_CORRECTION")
-                .unwrap_or_else(|_| "1.0".to_string())
+                .unwrap_or_else(|_| "1.3".to_string())
                 .parse()
                 .context("Failed to parse WEATHER_SPREAD_CORRECTION")?,
             stop_loss_pct: env::var("STOP_LOSS_PCT")
@@ -292,7 +292,7 @@ mod tests {
         assert_eq!(config.min_edge_threshold, 0.08);
         assert_eq!(config.estimator_request_timeout_secs, 30);
         assert_eq!(config.estimator_max_retries, 2);
-        assert_eq!(config.weather_spread_correction, 1.0);
+        assert_eq!(config.weather_spread_correction, 1.3);
         assert_eq!(config.cycle_frequency_high_secs, 600);
         assert_eq!(config.cycle_frequency_low_secs, 1800);
         assert_eq!(config.low_bankroll_threshold, 200.0);
