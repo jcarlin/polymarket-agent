@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from polymarket_client import PolymarketClient
+from weather.hrrr import fetch_hrrr_temperature, is_available as hrrr_is_available, is_same_day
 from weather.nbm import fetch_nbm_percentiles, is_available as nbm_is_available, nbm_anchor_and_spread
 from weather.nws import fetch_nws_forecast
 from weather.open_meteo import CITY_CONFIGS, fetch_ensemble
@@ -146,12 +147,24 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
 
     config = CITY_CONFIGS[city]
 
-    # Fallback chain for anchor: NBM (best) → NWS → raw ensemble
+    # Fallback chain: HRRR (same-day) → NBM → NWS → raw ensemble
     nws_high: float | None = None
     nbm_anchor_val: float | None = None
     nbm_spread_val: float | None = None
+    hrrr_anchor_val: float | None = None
 
-    # Try NBM first (gold standard, calibrated percentiles)
+    # Try HRRR first for same-day markets (freshest hourly data)
+    if is_same_day(date) and hrrr_is_available():
+        try:
+            hrrr_data = fetch_hrrr_temperature(config.lat, config.lon)
+            if hrrr_data is not None:
+                hrrr_anchor_val = hrrr_data.max_temp_f
+                logger.info("HRRR anchor for %s: %.1f°F (init=%s, %dh)",
+                            city, hrrr_anchor_val, hrrr_data.init_time, hrrr_data.valid_hours)
+        except Exception as e:
+            logger.warning("HRRR fetch failed for %s (falling back): %s", city, e)
+
+    # Try NBM (gold standard, calibrated percentiles)
     if nbm_is_available():
         try:
             import numpy as np
@@ -170,11 +183,17 @@ async def weather_probabilities(city: str, date: str) -> WeatherResponse:
     except Exception as e:
         logger.warning("NWS fetch failed for %s/%s (continuing without): %s", city, date, e)
 
+    # HRRR overrides NBM anchor for same-day (freshest data wins)
+    # but use NBM spread (better calibrated uncertainty)
+    effective_nbm_anchor = nbm_anchor_val
+    if hrrr_anchor_val is not None:
+        effective_nbm_anchor = hrrr_anchor_val
+
     probs = compute_bucket_probabilities(
         forecast,
         spread_correction=WEATHER_SPREAD_CORRECTION,
         nws_anchor=nws_high,
-        nbm_anchor=nbm_anchor_val,
+        nbm_anchor=effective_nbm_anchor,
         nbm_spread=nbm_spread_val,
     )
 
