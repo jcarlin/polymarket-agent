@@ -55,7 +55,9 @@ class EnsembleForecast:
     forecast_date: str  # YYYY-MM-DD
     gefs_daily_max: list[float] = field(default_factory=list)  # 31 members
     ecmwf_daily_max: list[float] = field(default_factory=list)  # 51 members
-    all_members: list[float] = field(default_factory=list)  # combined 82
+    gem_daily_max: list[float] = field(default_factory=list)  # 21 members (Canadian GEM)
+    icon_daily_max: list[float] = field(default_factory=list)  # 40 members (DWD ICON-EPS)
+    all_members: list[float] = field(default_factory=list)  # combined 143
 
 
 def _celsius_to_fahrenheit(c: float) -> float:
@@ -121,12 +123,21 @@ async def fetch_ensemble(
 
     gefs_maxes: list[float] = []
     ecmwf_maxes: list[float] = []
+    gem_maxes: list[float] = []
+    icon_maxes: list[float] = []
+
+    # Core models (required): GEFS (31) + ECMWF (51) = 82 members
+    # Extra models (best-effort): GEM (21) + ICON (40) = 61 more → 143 total
+    core_models = [("gefs", "gfs_seamless"), ("ecmwf", "ecmwf_ifs025")]
+    extra_models = [("gem", "gem_global"), ("icon", "icon_seamless")]
 
     try:
-        for model_name, model_param in [("gefs", "gfs_seamless"), ("ecmwf", "ecmwf_ifs025")]:
+        for model_name, model_param in core_models + extra_models:
+            is_extra = model_name in ("gem", "icon")
             last_err: Optional[Exception] = None
             resp = None
-            for attempt in range(max_retries):
+            retries = max_retries if not is_extra else 1  # Fewer retries for extras
+            for attempt in range(retries):
                 try:
                     model_params = {**params, "models": model_param}
                     resp = await session.get(OPEN_METEO_ENSEMBLE_URL, params=model_params)
@@ -134,14 +145,21 @@ async def fetch_ensemble(
                     break
                 except Exception as e:
                     last_err = e
-                    if attempt < max_retries - 1:
+                    if attempt < retries - 1:
                         await asyncio.sleep(1.0 * (attempt + 1))
             else:
-                logger.error(
-                    "Failed to fetch %s for %s after %d retries: %s",
-                    model_name, city, max_retries, last_err,
-                )
-                return None
+                if is_extra:
+                    logger.warning(
+                        "Extra model %s failed for %s (continuing without): %s",
+                        model_name, city, last_err,
+                    )
+                    continue
+                else:
+                    logger.error(
+                        "Failed to fetch %s for %s after %d retries: %s",
+                        model_name, city, retries, last_err,
+                    )
+                    return None
 
             data = resp.json()
             hourly = data.get("hourly", {})
@@ -157,16 +175,22 @@ async def fetch_ensemble(
 
             if model_name == "gefs":
                 gefs_maxes = daily_maxes
-            else:
+            elif model_name == "ecmwf":
                 ecmwf_maxes = daily_maxes
+            elif model_name == "gem":
+                gem_maxes = daily_maxes
+            elif model_name == "icon":
+                icon_maxes = daily_maxes
 
-        all_members = gefs_maxes + ecmwf_maxes
+        all_members = gefs_maxes + ecmwf_maxes + gem_maxes + icon_maxes
         return EnsembleForecast(
             city=city,
             station_icao=config.icao,
             forecast_date=date,
             gefs_daily_max=gefs_maxes,
             ecmwf_daily_max=ecmwf_maxes,
+            gem_daily_max=gem_maxes,
+            icon_daily_max=icon_maxes,
             all_members=all_members,
         )
     finally:

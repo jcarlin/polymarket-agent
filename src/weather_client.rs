@@ -63,8 +63,8 @@ pub fn city_slug(code: &str) -> Option<&'static str> {
 
 /// All unique city codes (deduplicated from CITY_PATTERNS).
 pub const WEATHER_CITY_CODES: &[&str] = &[
-    "NYC", "LAX", "CHI", "HOU", "PHX", "PHL", "SAN", "SDG", "DAL", "SJC",
-    "ATL", "MIA", "BOS", "SEA", "DEN", "DCA", "MSP", "DTW", "TPA", "STL",
+    "NYC", "LAX", "CHI", "HOU", "PHX", "PHL", "SAN", "SDG", "DAL", "SJC", "ATL", "MIA", "BOS",
+    "SEA", "DEN", "DCA", "MSP", "DTW", "TPA", "STL",
 ];
 
 /// Probability for a single temperature bucket
@@ -87,6 +87,24 @@ pub struct WeatherProbabilities {
     pub ensemble_std: f64,
     pub gefs_count: u32,
     pub ecmwf_count: u32,
+    /// Canadian GEM ensemble member count
+    #[serde(default)]
+    pub gem_count: Option<u32>,
+    /// DWD ICON-EPS ensemble member count
+    #[serde(default)]
+    pub icon_count: Option<u32>,
+    /// NWS official forecast high temperature used as bias-correction anchor
+    #[serde(default)]
+    pub nws_forecast_high: Option<f64>,
+    /// Bias correction applied (ensemble shifted by this many °F to match anchor)
+    #[serde(default)]
+    pub bias_correction: Option<f64>,
+    /// NBM median (p50) temperature if available
+    #[serde(default)]
+    pub nbm_p50: Option<f64>,
+    /// Which anchor source was used: "nbm", "nws", or "raw"
+    #[serde(default)]
+    pub anchor_source: Option<String>,
 }
 
 /// Parsed weather market info from Polymarket question text
@@ -608,6 +626,12 @@ mod tests {
             ensemble_std: 2.0,
             gefs_count: 31,
             ecmwf_count: 51,
+            nws_forecast_high: None,
+            bias_correction: None,
+            gem_count: None,
+            icon_count: None,
+            nbm_p50: None,
+            anchor_source: None,
         };
 
         let info = WeatherMarketInfo {
@@ -652,6 +676,12 @@ mod tests {
             ensemble_std: 3.0,
             gefs_count: 31,
             ecmwf_count: 51,
+            nws_forecast_high: None,
+            bias_correction: None,
+            gem_count: None,
+            icon_count: None,
+            nbm_p50: None,
+            anchor_source: None,
         };
 
         let info = WeatherMarketInfo {

@@ -3,9 +3,7 @@ use tracing::{info, warn};
 
 use crate::clob_client::ClobClient;
 use crate::db::{Database, PositionRow};
-use crate::weather_client::{
-    get_weather_model_probability, parse_weather_market, WeatherClient,
-};
+use crate::weather_client::{get_weather_model_probability, parse_weather_market, WeatherClient};
 
 /// Action to take for a position after management checks.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,10 +167,9 @@ impl PositionManager {
                                     fresh_prob,
                                 );
                                 pos_refreshed.estimated_probability = Some(fresh_prob);
-                                if let Err(e) = db.update_position_estimate(
-                                    &pos.market_condition_id,
-                                    fresh_prob,
-                                ) {
+                                if let Err(e) = db
+                                    .update_position_estimate(&pos.market_condition_id, fresh_prob)
+                                {
                                     warn!("Failed to update position estimate: {}", e);
                                 }
                             }
@@ -456,11 +453,7 @@ impl PositionManager {
 
     /// Check if total weather exposure exceeds the global weather cap.
     /// Returns true if new weather bets should be blocked.
-    pub fn is_total_weather_over_limit(
-        &self,
-        positions: &[PositionRow],
-        bankroll: f64,
-    ) -> bool {
+    pub fn is_total_weather_over_limit(&self, positions: &[PositionRow], bankroll: f64) -> bool {
         if bankroll <= 0.0 {
             return false;
         }

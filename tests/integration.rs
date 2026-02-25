@@ -248,6 +248,12 @@ fn test_weather_market_parsing_and_bucket_lookup() {
         ensemble_std: 2.0,
         gefs_count: 31,
         ecmwf_count: 51,
+        gem_count: None,
+        icon_count: None,
+        nws_forecast_high: None,
+        bias_correction: None,
+        nbm_p50: None,
+        anchor_source: None,
     };
 
     let prob = get_weather_model_probability(&info, &probs).unwrap();
